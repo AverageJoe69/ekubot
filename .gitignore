@@ -1,0 +1,10 @@
+# Node
+node_modules/
+dist/
+.npm/
+.DS_Store
+
+# Env & local
+.env
+.env.local
+*.log
