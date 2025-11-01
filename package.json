@@ -4,14 +4,17 @@
   "type": "module",
   "scripts": {
     "start": "bun run index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "dev": "tsx index.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^2.0.58",
+    "@cartridge/controller": "^0.10.7",
     "@daydreamsai/cli": "^0.3.22",
     "@daydreamsai/core": "^0.3.22",
     "@daydreamsai/telegram": "^0.3.22",
     "ai": "^5.0.84",
+    "starknet": "^8.6.0",
     "typescript": "5.9.2",
     "zod": "^4.1.12"
   },
