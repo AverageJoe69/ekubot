@@ -30,29 +30,47 @@ const telegramService = service({
     container.singleton("telegraf", () => new Telegraf(token));
   },
 
-  async boot(container) {
+  // --- replace your async boot(container) with this ---
+async boot(container) {
     const telegraf = resolveOptional<Telegraf>(container, "telegraf");
     if (!telegraf) return;
-
+  
     try {
       telegraf.start((ctx) =>
-        ctx.reply(
-          "✅ Ekubo agent online.\n\nTry:\n• /goal <text>\n• /status\n• or just type your request."
-        )
+        ctx.reply("✅ Ekubo agent online.\n\n/goal <text>\n/status\n(or just type)")
       );
-      telegraf.help((ctx) =>
-        ctx.reply("Commands:\n/goal <text>\n/status\n(Free text also works.)")
-      );
-
+      telegraf.help((ctx) => ctx.reply("Commands:\n/goal <text>\n/status"));
+  
       console.log("[telegram] starting…");
-      await telegraf.launch({ dropPendingUpdates: true });
-
-      const info = await telegraf.telegram.getMe();
-      console.log("[telegram] bot ready:", info);
+  
+      // DO NOT await launch — run it in the background
+      Promise.resolve(
+        telegraf.launch({ dropPendingUpdates: true })
+      ).then(() => {
+        console.log("[telegram] launch() kicked off (polling).");
+      }).catch((err) => {
+        console.error("[telegram] launch() error (continuing without Telegram):", err);
+      });
+  
+      // Fire-and-forget readiness probe with timeout (non-blocking)
+      const getMeWithTimeout = Promise.race([
+        telegraf.telegram.getMe(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("getMe timeout")), 7000)),
+      ]);
+  
+      getMeWithTimeout
+        .then((info: any) => console.log("[telegram] bot ready:", info))
+        .catch((err) => console.warn("[telegram] getMe probe failed:", err));
+  
+      // graceful shutdown
+      process.once("SIGINT", () => telegraf.stop("SIGINT"));
+      process.once("SIGTERM", () => telegraf.stop("SIGTERM"));
     } catch (err) {
       console.error("[telegram] boot error (continuing without Telegram):", err);
-      // Don’t crash the whole worker if Telegram fails to start.
+      // Do not throw — keep the worker alive even if TG is down.
     }
+  },
+  
 
     // graceful shutdown
     process.once("SIGINT", () => telegraf.stop("SIGINT"));
