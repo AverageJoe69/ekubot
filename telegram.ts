@@ -30,51 +30,44 @@ const telegramService = service({
     container.singleton("telegraf", () => new Telegraf(token));
   },
 
-  // --- replace your async boot(container) with this ---
-async boot(container) {
+  async boot(container) {
     const telegraf = resolveOptional<Telegraf>(container, "telegraf");
     if (!telegraf) return;
-  
+
     try {
       telegraf.start((ctx) =>
         ctx.reply("✅ Ekubo agent online.\n\n/goal <text>\n/status\n(or just type)")
       );
       telegraf.help((ctx) => ctx.reply("Commands:\n/goal <text>\n/status"));
-  
+
       console.log("[telegram] starting…");
-  
-      // DO NOT await launch — run it in the background
-      Promise.resolve(
-        telegraf.launch({ dropPendingUpdates: true })
-      ).then(() => {
-        console.log("[telegram] launch() kicked off (polling).");
-      }).catch((err) => {
-        console.error("[telegram] launch() error (continuing without Telegram):", err);
-      });
-  
-      // Fire-and-forget readiness probe with timeout (non-blocking)
+
+      // Non-blocking launch
+      Promise.resolve(telegraf.launch({ dropPendingUpdates: true }))
+        .then(() => {
+          console.log("[telegram] launch() kicked off (polling).");
+        })
+        .catch((err) => {
+          console.error("[telegram] launch() error (continuing without Telegram):", err);
+        });
+
+      // Fire-and-forget readiness probe with timeout
       const getMeWithTimeout = Promise.race([
         telegraf.telegram.getMe(),
         new Promise((_, rej) => setTimeout(() => rej(new Error("getMe timeout")), 7000)),
       ]);
-  
+
       getMeWithTimeout
         .then((info: any) => console.log("[telegram] bot ready:", info))
         .catch((err) => console.warn("[telegram] getMe probe failed:", err));
-  
-      // graceful shutdown
+
+      // graceful shutdown (these MUST be inside try/catch block but after launch)
       process.once("SIGINT", () => telegraf.stop("SIGINT"));
       process.once("SIGTERM", () => telegraf.stop("SIGTERM"));
     } catch (err) {
       console.error("[telegram] boot error (continuing without Telegram):", err);
-      // Do not throw — keep the worker alive even if TG is down.
+      // Do not throw — keep the worker alive even if Telegram fails to start.
     }
-  },
-  
-
-    // graceful shutdown
-    process.once("SIGINT", () => telegraf.stop("SIGINT"));
-    process.once("SIGTERM", () => telegraf.stop("SIGTERM"));
   },
 });
 
@@ -144,16 +137,16 @@ export const telegramExtension = extension({
         if (!telegraf) return () => {};
 
         telegraf.on("message", (ctx) => {
-          if (!("text" in ctx.message)) return;
+          if (!("text" in (ctx.message as any))) return;
           const chatId = ctx.chat.id;
-          const from = ctx.message.from;
+          const from = (ctx.message as any).from;
 
           send(
             telegramChat,
             { chatId },
             {
               user: { id: from.id, username: from.username ?? "user" },
-              text: ctx.message.text,
+              text: (ctx.message as any).text,
             }
           );
         });
