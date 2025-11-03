@@ -1,20 +1,73 @@
 // telegram.ts
 import * as z from "zod";
-import { context, service, extension, input, output, splitTextIntoChunks } from "@daydreamsai/core";
+import {
+  context,
+  service,
+  extension,
+  input,
+  output,
+  splitTextIntoChunks,
+} from "@daydreamsai/core";
 import { Telegraf } from "telegraf";
 import type { Chat } from "@telegraf/types";
 
+// Safe resolver for Core 0.3.22
+function resolveOptional<T>(container: any, key: string): T | undefined {
+  try {
+    return container.resolve<T>(key);
+  } catch {
+    return undefined;
+  }
+}
+
 const telegramService = service({
   register(container) {
-    // Uses process.env.TELEGRAM_TOKEN (set by validateEnv in index.ts)
-    container.singleton("telegraf", () => new Telegraf(process.env.TELEGRAM_TOKEN!));
+    const token = process.env.TELEGRAM_TOKEN;
+    if (!token) {
+      console.warn("[telegram] TELEGRAM_TOKEN not set; extension disabled.");
+      return;
+    }
+    container.singleton("telegraf", () => new Telegraf(token));
   },
+
   async boot(container) {
-    const telegraf = container.resolve<Telegraf>("telegraf");
-    console.log("starting..");
-    telegraf.launch({ dropPendingUpdates: true });
-    const info = await telegraf.telegram.getMe();
-    console.log(info);
+    const telegraf = resolveOptional<Telegraf>(container, "telegraf");
+    if (!telegraf) return;
+
+    try {
+      telegraf.start((ctx) =>
+        ctx.reply("✅ Ekubo agent online.\n\n/goal <text>\n/status\n(or just type)")
+      );
+      telegraf.help((ctx) => ctx.reply("Commands:\n/goal <text>\n/status"));
+
+      console.log("[telegram] starting…");
+
+      // Non-blocking launch
+      Promise.resolve(telegraf.launch({ dropPendingUpdates: true }))
+        .then(() => {
+          console.log("[telegram] launch() kicked off (polling).");
+        })
+        .catch((err) => {
+          console.error("[telegram] launch() error (continuing without Telegram):", err);
+        });
+
+      // Fire-and-forget readiness probe with timeout
+      const getMeWithTimeout = Promise.race([
+        telegraf.telegram.getMe(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("getMe timeout")), 7000)),
+      ]);
+
+      getMeWithTimeout
+        .then((info: any) => console.log("[telegram] bot ready:", info))
+        .catch((err) => console.warn("[telegram] getMe probe failed:", err));
+
+      // graceful shutdown (these MUST be inside try/catch block but after launch)
+      process.once("SIGINT", () => telegraf.stop("SIGINT"));
+      process.once("SIGTERM", () => telegraf.stop("SIGTERM"));
+    } catch (err) {
+      console.error("[telegram] boot error (continuing without Telegram):", err);
+      // Do not throw — keep the worker alive even if Telegram fails to start.
+    }
   },
 });
 
@@ -24,18 +77,32 @@ const telegramChat = context({
   schema: z.object({ chatId: z.number() }),
 
   async setup(args, _settings, { container }) {
-    const telegraf = container.resolve<Telegraf>("telegraf");
-    const chat = (await telegraf.telegram.getChat(args.chatId)) as Chat;
+    const tg = resolveOptional<Telegraf>(container, "telegraf");
+    if (!tg) return { chat: undefined as unknown as Chat };
+    const chat = (await tg.telegram.getChat(args.chatId)) as Chat;
     return { chat };
   },
 
   description({ options: { chat } }) {
+    if (!chat) return "";
     if (chat.type === "private") {
-      return `You are in private telegram chat with ${chat.username} id: ${chat.id}`;
+      return `Private Telegram chat with @${chat.username ?? "user"} (id ${chat.id}).`;
     }
     return "";
   },
 });
+
+// Light intent hints to steer the model toward your action
+function inferIntent(text: string) {
+  const t = text.trim();
+  const goalMatch =
+    /^\/goal\s+(.+)/i.exec(t) ||
+    /^(?:set|update)\s+my\s+goal\s+to\s+['"]?(.+?)['"]?$/i.exec(t);
+  if (goalMatch) return { intent: "setGoal", args: { task: goalMatch[1] } };
+  if (/^\/status\b/i.test(t) || /what'?s my (current )?goal\??/i.test(t))
+    return { intent: "status", args: {} };
+  return { intent: "message", args: {} };
+}
 
 export const telegramExtension = extension({
   name: "telegram",
@@ -45,30 +112,41 @@ export const telegramExtension = extension({
   inputs: {
     "telegram:message": input({
       schema: z.object({
-        user: z.object({ id: z.number(), username: z.string().optional().default("user") }),
+        user: z.object({
+          id: z.number(),
+          username: z.string().optional().default("user"),
+        }),
         text: z.string(),
       }),
-      // Produce a Daydreams input that carries the text and userId
-      format: ({ data }) => ({
-        tag: "input",
-        params: { type: "telegram:message", userId: String(data.user.id), username: data.user.username ?? "user" },
-        children: data.text,
-      }),
+      format: ({ data }) => {
+        const { intent, args } = inferIntent(data.text);
+        return {
+          tag: "input",
+          params: {
+            type: "telegram:message",
+            userId: String(data.user.id),
+            username: data.user.username ?? "user",
+            intent,
+          },
+          children: data.text,
+          meta: { args },
+        };
+      },
       subscribe(send, { container }) {
-        const telegraf = container.resolve<Telegraf>("telegraf");
+        const telegraf = resolveOptional<Telegraf>(container, "telegraf");
+        if (!telegraf) return () => {};
 
         telegraf.on("message", (ctx) => {
-          if (!("text" in ctx.message)) return;
-
+          if (!("text" in (ctx.message as any))) return;
           const chatId = ctx.chat.id;
-          const from = ctx.message.from;
+          const from = (ctx.message as any).from;
 
           send(
             telegramChat,
             { chatId },
             {
               user: { id: from.id, username: from.username ?? "user" },
-              text: ctx.message.text,
+              text: (ctx.message as any).text,
             }
           );
         });
@@ -80,21 +158,24 @@ export const telegramExtension = extension({
 
   outputs: {
     "telegram:message": output({
-      // NOTE: Your model must emit JSON like:
-      // <output type="telegram:message">{"userId":"<id>","content":"hello"}</output>
       schema: z.object({
-        userId: z.string().describe("Telegram user/chat id to send to"),
-        content: z.string().describe("Message text (Markdown supported)"),
+        userId: z.string().describe("Telegram chat/user id to send to"),
+        content: z.string().describe("Markdown-compatible message"),
       }),
       description: "Send a Telegram message",
       enabled({ context }) {
         return context.type === telegramChat.type;
       },
       async handler(data, _ctx, { container }) {
-        const tg = container.resolve<Telegraf>("telegraf").telegram;
+        const telegraf = resolveOptional<Telegraf>(container, "telegraf");
+        if (!telegraf) return { ok: false, error: "telegram disabled" };
+
         const chunks = splitTextIntoChunks(data.content, { maxChunkSize: 4096 });
         for (const chunk of chunks) {
-          await tg.sendMessage(data.userId, chunk, { parse_mode: "Markdown" });
+          await telegraf.telegram.sendMessage(data.userId, chunk, {
+            parse_mode: "Markdown",
+            disable_web_page_preview: true,
+          });
         }
         return { ok: true, at: Date.now() };
       },
