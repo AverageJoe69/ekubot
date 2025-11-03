@@ -15,29 +15,34 @@ import {
 } from "@daydreamsai/core";
 import * as z from "zod";
 import { telegramExtension } from "./telegram";
+import { ekuboTraderContext } from "./ekuboTrader"; // ⟵ include your trader
 
 // --- ENV ---
 const env = validateEnv(
   z.object({
     OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
     TELEGRAM_TOKEN: z.string().optional(),
+    NETWORK: z.string().optional().default("sepolia"),
   })
 );
 
-// --- MODEL ---
-const openai = createOpenAI({
-  apiKey: env.OPENAI_API_KEY!,
+// quick sanity print in logs
+console.log("[env-check]", {
+  OPENAI: typeof process.env.OPENAI_API_KEY,
+  TELEGRAM: typeof process.env.TELEGRAM_TOKEN,
+  NETWORK: env.NETWORK,
 });
 
-// --- CONTEXT TEMPLATE ---
-const template = `
-Goal: {{goal}}
-`;
+// --- MODEL ---
+const openai = createOpenAI({ apiKey: env.OPENAI_API_KEY! });
+
+// --- GOAL CONTEXT TEMPLATE ---
+const template = `Goal: {{goal}}`;
 
 // --- MEMORY SHAPE ---
 type GoalMemory = { goal: string };
 
-// --- CONTEXT ---
+// --- GOAL CONTEXT ---
 export const goalContext = context<GoalMemory>({
   type: "goal",
   schema: z.object({
@@ -52,11 +57,26 @@ export const goalContext = context<GoalMemory>({
   render({ memory }) {
     return render(template, { goal: memory.goal || "(none set yet)" });
   },
+  // Stronger instructions so the model *always* tool-calls and replies to Telegram
   instructions: `
-If the current input is <input type="telegram:message" userId="...">,
-reply using:
-<output type="telegram:message">{"userId":"<same userId>","content":"<your reply>"}</output>
-Otherwise, you may reply with CLI output.
+You have one action available:
+- addTask({ task: string }): stores/updates the current goal text.
+
+Rules:
+1) When the input intends to set or update a goal (e.g. "/goal …", "set my goal to …",
+   or the input param intent=="setGoal"), ALWAYS call addTask with the goal text.
+2) When responding to a Telegram message input (<input type="telegram:message" userId="...">),
+   ALWAYS reply using:
+   <output type="telegram:message">{"userId":"<same userId>","content":"<reply text>"}</output>
+
+Examples:
+
+<input type="telegram:message" userId="123" intent="setGoal">Set my goal to 'auto-trade ETH/USDC safely'</input>
+# tool: addTask {"task":"auto-trade ETH/USDC safely"}
+<output type="telegram:message">{"userId":"123","content":"✅ Goal set to: auto-trade ETH/USDC safely"}</output>
+
+<input type="telegram:message" userId="123">What's my current goal?</input>
+<output type="telegram:message">{"userId":"123","content":"Your current goal is: auto-trade ETH/USDC safely"}</output>
 `.trim(),
 });
 
@@ -85,7 +105,8 @@ if (env.TELEGRAM_TOKEN) {
 const agent = createDreams({
   model: openai("gpt-4o"),
   extensions,
-  contexts: [goalContext],
+  // Register BOTH contexts so the agent can use either
+  contexts: [goalContext, ekuboTraderContext],
 });
 
 // --- STARTUP ---
@@ -93,9 +114,17 @@ async function main() {
   await agent.start();
 
   console.log("🚀 my-agent running (Railway / local mode)");
-  console.log("   - Telegram: active" + (env.TELEGRAM_TOKEN ? " ✅" : " ❌"));
+  console.log("   - Telegram:", env.TELEGRAM_TOKEN ? "✅" : "❌");
   console.log("   - CLI: available (type in terminal)");
+  console.log("   - Network:", env.NETWORK);
 
+  // Start the trader context as the default running session
+  await agent.run({
+    context: ekuboTraderContext,
+    args: { userId: "default", network: env.NETWORK },
+  });
+
+  // Also keep a goal session available for /goal and /status
   await agent.run({
     context: goalContext,
     args: { id: "default" },
