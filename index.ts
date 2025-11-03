@@ -1,7 +1,9 @@
 /**
- * Daydreams agent with cliExtension extension(s)
- * Using OpenAI as the model provider
+ * Daydreams agent running on Railway (Node)
+ * CLI + Telegram extensions + OpenAI model.
  */
+
+import "dotenv/config";
 import { cliExtension } from "@daydreamsai/cli";
 import { createOpenAI } from "@ai-sdk/openai";
 import {
@@ -12,15 +14,13 @@ import {
   validateEnv,
 } from "@daydreamsai/core";
 import * as z from "zod";
-
-// 👉 Telegram extension (from your local ./telegram file)
 import { telegramExtension } from "./telegram";
 
 // --- ENV ---
 const env = validateEnv(
   z.object({
     OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
-    TELEGRAM_TOKEN: z.string().optional(), // optional so CLI-only still works
+    TELEGRAM_TOKEN: z.string().optional(),
   })
 );
 
@@ -35,38 +35,23 @@ Goal: {{goal}}
 `;
 
 // --- MEMORY SHAPE ---
-type GoalMemory = {
-  goal: string;
-};
+type GoalMemory = { goal: string };
 
-// --- CONTEXT (Daydreams style) ---
+// --- CONTEXT ---
 export const goalContext = context<GoalMemory>({
   type: "goal",
   schema: z.object({
     id: z.string().describe("Unique identifier for the goal session"),
   }),
-
-  // (optional) a stable key for this context instance
   key({ id }) {
     return id;
   },
-
-  // initialize memory for a new instance
   create() {
-    return {
-      goal: "",
-    };
+    return { goal: "" };
   },
-
-  // what the model sees
   render({ memory }) {
-    return render(template, {
-      goal: memory.goal || "(none set yet)",
-    });
+    return render(template, { goal: memory.goal || "(none set yet)" });
   },
-
-  // Nudge the model: if input came from Telegram, respond via Telegram.
-  // NOTE: the telegram output expects a JSON body { "userId": "...", "content": "..." }
   instructions: `
 If the current input is <input type="telegram:message" userId="...">,
 reply using:
@@ -90,32 +75,34 @@ goalContext.setActions([
 
 // --- EXTENSIONS ---
 const extensions = [cliExtension];
-
-// Only attach Telegram if the token is present
 if (env.TELEGRAM_TOKEN) {
   extensions.push(telegramExtension);
 } else {
-  console.warn(
-    "[telegram] TELEGRAM_TOKEN not set; running CLI only (no Telegram)."
-  );
+  console.warn("[telegram] TELEGRAM_TOKEN not set; running CLI only.");
 }
 
 // --- AGENT ---
 const agent = createDreams({
   model: openai("gpt-4o"),
   extensions,
-  contexts: [goalContext], // <-- IMPORTANT: register contexts here
+  contexts: [goalContext],
 });
 
-// --- START ---
+// --- STARTUP ---
 async function main() {
   await agent.start();
 
-  // Run the agent against our context, providing required args (CLI path)
+  console.log("🚀 my-agent running (Railway / local mode)");
+  console.log("   - Telegram: active" + (env.TELEGRAM_TOKEN ? " ✅" : " ❌"));
+  console.log("   - CLI: available (type in terminal)");
+
   await agent.run({
     context: goalContext,
-    args: { id: "test" },
+    args: { id: "default" },
   });
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});

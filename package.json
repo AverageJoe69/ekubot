@@ -12,6 +12,7 @@
     "@daydreamsai/core": "^0.3.22",
     "@daydreamsai/telegram": "^0.3.22",
     "ai": "^5.0.84",
+    "dotenv": "^17.2.3",
     "typescript": "5.9.2",
     "zod": "^4.1.12"
   },
