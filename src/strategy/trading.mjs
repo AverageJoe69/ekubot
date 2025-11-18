@@ -48,76 +48,91 @@ function ensureConfig(chatId) {
 // Core tick
 // -------------------------------------------------------------
 
-/**
- * tradeTick(chatId, { mode })
- * mode = "paper" | "live"
- */
 export async function tradeTick(chatId, { mode = "paper" } = {}) {
-  const now = new Date().toISOString();
-
-  const cfg = ensureConfig(chatId);
-  const pos = ensurePosition(chatId);
-
-  // 1. Price data
-  const priceData = await getStrkPriceHistory();
-  const latestPrice = await getLatestStrkPrice();
-
-  // 2. Ask strategy (GPT) what to do
-  const intents = await baseStrategy({
-    chatId,
-    priceData,
-    latestPrice,
-    position: { ...pos, latestPrice },
-    now,
-    mode,
-  });
-
-  if (!intents.length) {
+    const now = new Date().toISOString();
+  
+    const cfg = ensureConfig(chatId);
+    const pos = ensurePosition(chatId);
+  
+    // 1. Price data
+    const priceData = await getStrkPriceHistory();
+    const latestPrice = await getLatestStrkPrice();
+  
+    // 2. Build a minimal snapshot compatible with baseStrategy
+    const snapshot = {
+      tokens: [
+        {
+          symbol: "STRK",
+          address: "0x4718f5...", // ← optional, safe either way
+          bestPool: {
+            keyHash: "STRK/USDC",
+            fee: "0x0",
+            tickSpacing: "0x0",
+            liquidityBigInt: 1000000000000000000n, // pretend 1e18
+          },
+        },
+      ],
+    };
+  
+    // 3. Ask strategy
+    const intents = await baseStrategy({
+      chatId,
+      snapshot,       // ← FIXED: strategy now works again
+      priceData,
+      latestPrice,
+      position: { ...pos, latestPrice },
+      now,
+      mode,
+    });
+  
+    // 4. No intent → HOLD
+    if (!intents.length) {
+      return {
+        updatedAt: now,
+        mode,
+        price: latestPrice,
+        intents: [],
+        position: { ...pos },
+        notes: "GPT decided to HOLD",
+      };
+    }
+  
+    // 5. Apply paper mode
+    const intent = intents[0];
+    if (mode === "paper") {
+      applyPaperTrade(pos, intent, latestPrice);
+      positions.set(chatKey(chatId), pos);
+      return {
+        updatedAt: now,
+        mode,
+        price: latestPrice,
+        intents: [intent],
+        position: { ...pos },
+      };
+    }
+  
+    // 6. Live (future)
+    if (mode === "live") {
+      return {
+        updatedAt: now,
+        mode,
+        price: latestPrice,
+        intents: [intent],
+        position: { ...pos },
+        liveWarning: "live execution not implemented yet",
+      };
+    }
+  
     return {
       updatedAt: now,
       mode,
       price: latestPrice,
       intents: [],
       position: { ...pos },
-      notes: "GPT decided to HOLD",
+      notes: "Unknown mode",
     };
   }
-
-  const intent = intents[0];
-
-  if (mode === "paper") {
-    applyPaperTrade(pos, intent, latestPrice);
-    positions.set(chatKey(chatId), pos);
-    return {
-      updatedAt: now,
-      mode,
-      price: latestPrice,
-      intents: [intent],
-      position: { ...pos },
-    };
-  }
-
-  if (mode === "live") {
-    // TODO: wire real Ekubo swap here later
-    return {
-      updatedAt: now,
-      mode,
-      price: latestPrice,
-      intents: [intent],
-      position: { ...pos },
-      liveWarning: "live execution not implemented yet",
-    };
-  }
-
-  return {
-    updatedAt: now,
-    mode,
-    price: latestPrice,
-    intents: [],
-    position: { ...pos },
-    notes: "Unknown mode",
-  };
-}
+  
 
 function applyPaperTrade(position, intent, latestPrice) {
   const side = intent.side;
