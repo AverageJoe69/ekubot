@@ -1,11 +1,12 @@
 // src/strategy/tracker.mjs
 import { getUniverse } from "../state/watchlist.mjs";
+import { buildUniverseFromText } from "../utils/ekubo.mjs";
 
 /**
- * Normalize a value into a BigInt, safely handling what survives JSON:
+ * Normalize a value into a BigInt, safely handling:
+ * - bigint
  * - string (e.g. "1000000000000000000")
  * - number
- * - bigint
  * - null/undefined
  */
 function normalizeBigInt(value) {
@@ -24,7 +25,6 @@ function normalizeBigInt(value) {
     return BigInt(Math.floor(value));
   }
 
-  // Anything else (object, etc.) → treat as zero.
   return 0n;
 }
 
@@ -34,7 +34,6 @@ function normalizeBigInt(value) {
  */
 export function pickBestUsdcPoolForToken(token) {
   const allPools = Array.isArray(token.usdcPools) ? token.usdcPools : [];
-
   if (!allPools.length) return null;
 
   const activePools = allPools.filter((p) => {
@@ -62,22 +61,41 @@ export function pickBestUsdcPoolForToken(token) {
 
 /**
  * Build a tracking snapshot from the stored universe for a chat.
- * Used by Telegram `/show_pairs` and by the trading loop.
+ *
+ * IMPORTANT:
+ * - We *rebuild* a fresh universe from rawInput via buildUniverseFromText,
+ *   so we get the same behaviour as testTrack.mjs (STRK/ETH pools with fake liquidity).
+ * - We DO NOT trust the stored tradable/usdcPools to have correct BigInt types.
  */
 export async function buildTrackingSnapshot(chatId) {
-  const universe = await getUniverse(chatId);
+  const storedUniverse = await getUniverse(chatId);
 
   if (
-    !universe ||
-    !Array.isArray(universe.tradable) ||
-    universe.tradable.length === 0
+    !storedUniverse ||
+    typeof storedUniverse.rawInput !== "string" ||
+    !storedUniverse.rawInput.trim()
   ) {
     return {
       chatId: String(chatId),
       hasUniverse: false,
-      universe: universe || null,
+      universe: storedUniverse || null,
       universeUpdatedAt:
-        universe && universe.updatedAt ? universe.updatedAt : null,
+        storedUniverse && storedUniverse.updatedAt
+          ? storedUniverse.updatedAt
+          : null,
+      tokens: [],
+    };
+  }
+
+  // 🔁 Rebuild a clean, static universe from rawInput
+  const universe = await buildUniverseFromText(storedUniverse.rawInput);
+
+  if (!Array.isArray(universe.tradable) || !universe.tradable.length) {
+    return {
+      chatId: String(chatId),
+      hasUniverse: false,
+      universe,
+      universeUpdatedAt: universe.updatedAt,
       tokens: [],
     };
   }
