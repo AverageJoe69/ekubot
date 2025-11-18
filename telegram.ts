@@ -20,10 +20,6 @@ function resolveOptional<T>(container: any, key: string): T | undefined {
   }
 }
 
-// -------------------------------------------------------------
-// Legacy universe / tracking formatting (still safe to keep)
-// -------------------------------------------------------------
-
 function formatTrackingSnapshotMessage(snapshot: any): string {
   if (!snapshot.hasUniverse) {
     return "No universe set yet for this chat.\n\nUse `/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM` first.";
@@ -61,7 +57,17 @@ function formatTrackingSnapshotMessage(snapshot: any): string {
 
 /**
  * Format a human-readable summary of a trading universe/watchlist.
- * This consumes the shape returned by buildUniverseFromText in ekubo.mjs.
+ * This consumes the shape returned by buildUniverseFromText in ekubo.mjs:
+ *
+ * {
+ *   rawInput,
+ *   symbols,
+ *   tradable: [
+ *     { symbol, address, decimals, usdcPools, hasUsdcPool, raw }
+ *   ],
+ *   unresolved: [...],
+ *   updatedAt
+ * }
  */
 function formatUniverseMessage(universe: any | null | undefined): string {
   if (!universe || !universe.tradable) {
@@ -101,12 +107,14 @@ function formatUniverseMessage(universe: any | null | undefined): string {
   return lines.join("\n");
 }
 
-// -------------------------------------------------------------
-// Command registrations
-// -------------------------------------------------------------
-
 /**
- * /show_pairs → legacy tracking snapshot
+ * Register Telegram commands that manage the trading universe/watchlist.
+ *
+ * - /set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM
+ *   → builds a universe using Ekubo tokens + USDC pools and stores it per chat.
+ *
+ * - /show_universe
+ *   → displays the current universe for this chat.
  */
 async function registerTrackingCommands(telegraf: Telegraf) {
   const { buildTrackingSnapshot } = await import(
@@ -126,13 +134,6 @@ async function registerTrackingCommands(telegraf: Telegraf) {
   });
 }
 
-/**
- * STRK trading commands:
- * - /paper_tick
- * - /strk_status
- * - /live_on / /live_off
- * - /stop_and_flatten
- */
 async function registerTradingCommands(telegraf: Telegraf) {
   const {
     tradeTick,
@@ -149,7 +150,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
   telegraf.command("paper_tick", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
-      await ctx.reply("⏳ Running STRK paper trade tick…");
+      await ctx.reply("⏳ Running paper trade tick for current universe…");
 
       const result = await tradeTick(chatId, { mode: "paper" });
       const msg = formatPaperTickMessage(result);
@@ -163,7 +164,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
     }
   });
 
-  // /strk_status → show mode + balances + equity
+  // /strk_status → show balances + mode + equity
   telegraf.command("strk_status", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -176,7 +177,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
     }
   });
 
-  // /live_on → set mode to live
+  // /live_on → set mode to live (future real trades)
   telegraf.command("live_on", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -217,10 +218,8 @@ async function registerTradingCommands(telegraf: Telegraf) {
   });
 }
 
-/**
- * /set_universe and /show_universe (legacy Ekubo universe system)
- */
 async function registerUniverseCommands(telegraf: Telegraf) {
+  // Dynamic imports to avoid TS/ESM pain with .mjs from a .ts file.
   const { buildUniverseFromText } = await import(
     "./src/utils/ekubo.mjs"
   );
@@ -228,6 +227,7 @@ async function registerUniverseCommands(telegraf: Telegraf) {
     "./src/state/watchlist.mjs"
   );
 
+  // /set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM
   telegraf.command("set_universe", async (ctx) => {
     try {
       const text = (ctx.message as any).text as string;
@@ -260,6 +260,7 @@ async function registerUniverseCommands(telegraf: Telegraf) {
     }
   });
 
+  // /show_universe
   telegraf.command("show_universe", async (ctx) => {
     try {
       const universe = await getUniverse(ctx.chat.id);
@@ -271,10 +272,6 @@ async function registerUniverseCommands(telegraf: Telegraf) {
     }
   });
 }
-
-// -------------------------------------------------------------
-// Service + extension
-// -------------------------------------------------------------
 
 const telegramService = service({
   register(container) {
@@ -294,23 +291,18 @@ const telegramService = service({
       telegraf.start((ctx) =>
         ctx.reply(
           [
-            "✅ Ekubo / STRK agent online.",
+            "✅ Ekubo agent online.",
             "",
-            "Universe / debug:",
+            "/goal <text>",
+            "/status",
             "/set_universe <symbols>",
             "/show_universe",
             "/show_pairs",
-            "",
-            "STRK trading:",
-            "/paper_tick – run one STRK paper tick",
-            "/strk_status – show STRK balances & mode",
-            "/live_on – switch to LIVE mode (execution TBD)",
-            "/live_off – back to PAPER mode",
-            "/stop_and_flatten – halt & sell all STRK to USDC (paper)",
-            "",
-            "General agent commands:",
-            "/goal <text>",
-            "/status",
+            "/paper_tick",
+            "/strk_status",
+            "/live_on",
+            "/live_off",
+            "/stop_and_flatten",
             "",
             "(or just type)",
           ].join("\n"),
@@ -321,25 +313,27 @@ const telegramService = service({
         ctx.reply(
           [
             "Commands:",
+            "/goal <text>",
+            "/status",
             "/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM",
             "/show_universe",
             "/show_pairs",
-            "",
-            "/paper_tick – run STRK paper tick",
-            "/strk_status – show STRK balances & mode",
-            "/live_on – enable live mode (no swaps yet)",
-            "/live_off – disable live mode (paper only)",
-            "/stop_and_flatten – halt & sell all STRK to USDC (paper)",
-            "",
-            "/goal <text> – set agent goal",
-            "/status – show current goal/status",
+            "/paper_tick",
+            "/strk_status",
+            "/live_on",
+            "/live_off",
+            "/stop_and_flatten",
           ].join("\n"),
         ),
       );
 
-      // Register commands
+      // 🔧 Register /set_universe and /show_universe
       await registerUniverseCommands(telegraf);
+
+      // 🔧 Register /show_pairs tracking debug command
       await registerTrackingCommands(telegraf);
+
+      // 🔧 Register trading commands (paper tick + STRK things)
       await registerTradingCommands(telegraf);
 
       console.log("[telegram] starting…");
