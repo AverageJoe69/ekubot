@@ -1,41 +1,54 @@
 // src/wallet/botWallet.mjs
-import 'dotenv/config';
-import { RpcProvider, Account } from 'starknet';
+import "dotenv/config";
+import { RpcProvider, Account } from "starknet";
+
+// -----------------------------------------------------------------------------
+// CONFIG
+// -----------------------------------------------------------------------------
 
 const STARKNET_RPC_URL =
-  process.env.STARKNET_RPC_URL || 'https://api.cartridge.gg/x/starknet/mainnet';
+  process.env.STARKNET_RPC_URL ||
+  "https://starknet-mainnet.infura.io/v3/your-infura-key";
 
 const BOT_WALLET_ADDRESS = process.env.BOT_WALLET_ADDRESS;
 const BOT_WALLET_PRIVATE_KEY = process.env.BOT_WALLET_PRIVATE_KEY;
 
-// Reusable provider for the bot
-const provider = new RpcProvider({
-  nodeUrl: STARKNET_RPC_URL,
-});
+// Shared provider instance
+const provider = new RpcProvider({ nodeUrl: STARKNET_RPC_URL });
 
-/**
- * Returns a Starknet.js Account instance for the bot wallet.
- * Works with Starknet.js v8 (options-style constructor).
- */
-export async function getBotAccount() {
-  if (!BOT_WALLET_ADDRESS) {
-    throw new Error('BOT_WALLET_ADDRESS is not set in .env');
+// Cache the Account to avoid recreating it
+let cachedAccount = null;
+
+// -----------------------------------------------------------------------------
+// LEGACY EXPORT (telegram.ts requires this)
+// -----------------------------------------------------------------------------
+export function getStarknetProvider() {
+  return provider;
+}
+
+// -----------------------------------------------------------------------------
+// MAIN EXPORT — BOT ACCOUNT
+// -----------------------------------------------------------------------------
+export function getBotAccount() {
+  if (cachedAccount) return cachedAccount;
+
+  if (!BOT_WALLET_ADDRESS || !BOT_WALLET_PRIVATE_KEY) {
+    throw new Error(
+      "Missing BOT_WALLET_ADDRESS or BOT_WALLET_PRIVATE_KEY in .env"
+    );
   }
-  if (!BOT_WALLET_PRIVATE_KEY) {
-    throw new Error('BOT_WALLET_PRIVATE_KEY is not set in .env');
-  }
 
-  const chainId = await provider.getChainId();
-  console.log('🤖 Bot wallet address:', BOT_WALLET_ADDRESS);
-  console.log('🔗 Connected chainId:', chainId);
+  console.log("🤖 Bot wallet address:", BOT_WALLET_ADDRESS);
+  console.log("🔑 Bot private key prefix:", BOT_WALLET_PRIVATE_KEY.slice(0, 6));
+  console.log("🌐 RPC URL:", STARKNET_RPC_URL);
 
-  // 👇 NEW v8-style constructor: pass an options object
-  const account = new Account({
+  // Correct Starknet.js constructor:
+  // new Account(provider, address, privateKey)
+  cachedAccount = new Account(
     provider,
-    address: BOT_WALLET_ADDRESS,
-    privateKey: BOT_WALLET_PRIVATE_KEY,
-    cairoVersion: '1', // Ready/Argent-style account is almost certainly Cairo 1
-  });
+    BOT_WALLET_ADDRESS,
+    BOT_WALLET_PRIVATE_KEY
+  );
 
-  return account;
+  return cachedAccount;
 }

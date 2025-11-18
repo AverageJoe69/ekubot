@@ -20,6 +20,206 @@ function resolveOptional<T>(container: any, key: string): T | undefined {
   }
 }
 
+function formatTrackingSnapshotMessage(snapshot: any): string {
+    if (!snapshot.hasUniverse) {
+      return "No universe set yet for this chat.\n\nUse `/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM` first.";
+    }
+  
+    const lines: string[] = [];
+  
+    lines.push(
+      `📡 Tracking snapshot\n` +
+        `Universe updated: ${snapshot.universeUpdatedAt}\n` +
+        `Tokens: ${snapshot.tokens.length}`,
+    );
+  
+    for (const t of snapshot.tokens) {
+      lines.push("");
+      lines.push(`*${t.symbol}* (\`${t.address}\`)`);
+      lines.push(
+        `Pools vs USDC: total ${t.totalUsdcPools}, active ${t.activeUsdcPools}`,
+      );
+      if (!t.bestPool) {
+        lines.push("Best pool: _none (no active liquidity)_");
+        continue;
+      }
+      const keyShort =
+        String(t.bestPool.keyHash).slice(0, 10) + "…";
+      lines.push(
+        `Best pool: \`${keyShort}\`\n` +
+          `• fee: \`${t.bestPool.fee}\`\n` +
+          `• tickSpacing: \`${t.bestPool.tickSpacing}\`\n` +
+          `• liquidity: \`${(t.bestPool.liquidityBigInt ?? 0n).toString()}\``,
+      );
+    }
+  
+    return lines.join("\n");
+  }
+  
+/**
+ * Format a human-readable summary of a trading universe/watchlist.
+ * This consumes the shape returned by buildUniverseFromText in ekubo.mjs:
+ *
+ * {
+ *   rawInput,
+ *   symbols,
+ *   tradable: [
+ *     { symbol, address, decimals, usdcPools, hasUsdcPool, raw }
+ *   ],
+ *   unresolved: [...],
+ *   updatedAt
+ * }
+ */
+function formatUniverseMessage(universe: any | null | undefined): string {
+  if (!universe || !universe.tradable) {
+    return "No universe set yet.\n\nUse:\n`/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM`\n\nSymbols can be comma or space separated.";
+  }
+
+  const lines: string[] = [];
+
+  lines.push(
+    `📈 Current trading universe (${universe.tradable.length} token(s))\n` +
+      `Last updated: ${universe.updatedAt}`,
+  );
+
+  if (universe.tradable.length) {
+    lines.push("");
+    lines.push("✅ Tradable vs USDC:");
+    for (const t of universe.tradable) {
+      const addr = String(t.address ?? "");
+      const addrShort =
+        addr && addr.startsWith("0x") && addr.length > 12
+          ? `${addr.slice(0, 8)}…${addr.slice(-4)}`
+          : addr || "unknown";
+      const poolsCount = (t.usdcPools?.length ?? 0) as number;
+      lines.push(`- ${t.symbol} (${addrShort}) – ${poolsCount} USDC pool(s)`);
+    }
+  }
+
+  if (universe.unresolved?.length) {
+    const uniq = Array.from(new Set(universe.unresolved));
+    if (uniq.length) {
+      lines.push("");
+      lines.push("⚠️ Not tradable / not found:");
+      lines.push(`- ${uniq.join(", ")}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Register Telegram commands that manage the trading universe/watchlist.
+ *
+ * - /set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM
+ *   → builds a universe using Ekubo tokens + USDC pools and stores it per chat.
+ *
+ * - /show_universe
+ *   → displays the current universe for this chat.
+ *
+ * NOTE: Paths in the dynamic imports may need tweaking depending on where
+ * this file lives relative to src/. If telegram.ts is at project root,
+ * "./src/..." is correct. If it's inside src/, change to "./utils/..." etc.
+ */
+async function registerTrackingCommands(telegraf: Telegraf) {
+    const { buildTrackingSnapshot } = await import(
+      "./src/strategy/tracker.mjs"
+    );
+  
+    telegraf.command("show_pairs", async (ctx) => {
+      try {
+        const chatId = ctx.chat.id;
+        const snapshot = await buildTrackingSnapshot(chatId);
+        const msg = formatTrackingSnapshotMessage(snapshot);
+        await ctx.reply(msg, { parse_mode: "Markdown" });
+      } catch (err: any) {
+        console.error("[telegram:/show_pairs] error:", err);
+        await ctx.reply("❌ Failed to build tracking snapshot. Check logs.");
+      }
+    });
+  }
+  
+  async function registerTradingCommands(telegraf: Telegraf) {
+    const { tradeTick, formatPaperTickMessage } = await import(
+      "./src/strategy/trading.mjs"
+    );
+  
+    // /paper_tick → run one paper trade tick and show what the bot *would* do.
+    telegraf.command("paper_tick", async (ctx) => {
+      try {
+        const chatId = ctx.chat.id;
+        await ctx.reply(
+          "⏳ Running paper trade tick for current universe…",
+        );
+  
+        const result = await tradeTick(chatId, { mode: "paper" });
+        const msg = formatPaperTickMessage(result);
+  
+        await ctx.reply(msg, { parse_mode: "Markdown" });
+      } catch (err: any) {
+        console.error("[telegram:/paper_tick] error:", err);
+        await ctx.reply(
+          "❌ Paper trade tick failed. Check logs for details.",
+        );
+      }
+    });
+  }
+  
+async function registerUniverseCommands(telegraf: Telegraf) {
+  // Dynamic imports to avoid TS/ESM pain with .mjs from a .ts file.
+  const { buildUniverseFromText } = await import(
+    "./src/utils/ekubo.mjs"
+  );
+  const { getUniverse, setUniverse } = await import(
+    "./src/state/watchlist.mjs"
+  );
+
+  // /set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM
+  telegraf.command("set_universe", async (ctx) => {
+    try {
+      const text = (ctx.message as any).text as string;
+      const raw = text.split(" ").slice(1).join(" ").trim();
+
+      if (!raw) {
+        return ctx.reply(
+          "Usage:\n" +
+            "`/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM`\n\n" +
+            "Symbols can be comma or space separated.",
+          { parse_mode: "Markdown" },
+        );
+      }
+
+      await ctx.reply(
+        "⏳ Building trading universe from Ekubo tokens and USDC pools…",
+      );
+
+      const universe = await buildUniverseFromText(raw);
+      await setUniverse(ctx.chat.id, universe);
+
+      const msg =
+        "✅ Universe updated.\n\n" + formatUniverseMessage(universe);
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    } catch (err: any) {
+      console.error("[telegram:/set_universe] error:", err);
+      await ctx.reply(
+        "❌ Failed to build universe. Check logs and make sure Ekubo API is reachable.",
+      );
+    }
+  });
+
+  // /show_universe
+  telegraf.command("show_universe", async (ctx) => {
+    try {
+      const universe = await getUniverse(ctx.chat.id);
+      const msg = formatUniverseMessage(universe);
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    } catch (err: any) {
+      console.error("[telegram:/show_universe] error:", err);
+      await ctx.reply("❌ Failed to load universe. Check logs.");
+    }
+  });
+}
+
 const telegramService = service({
   register(container) {
     const token = process.env.TELEGRAM_TOKEN;
@@ -36,9 +236,44 @@ const telegramService = service({
 
     try {
       telegraf.start((ctx) =>
-        ctx.reply("✅ Ekubo agent online.\n\n/goal <text>\n/status\n(or just type)")
+        ctx.reply(
+          [
+            "✅ Ekubo agent online.",
+            "",
+            "/goal <text>",
+            "/status",
+            "/set_universe <symbols>",
+            "/show_universe",
+            "/show_pairs",
+            "/paper_tick",
+            "",
+            "(or just type)",
+          ].join("\n"),
+        ),
       );
-      telegraf.help((ctx) => ctx.reply("Commands:\n/goal <text>\n/status"));
+
+      telegraf.help((ctx) =>
+        ctx.reply(
+          [
+            "Commands:",
+            "/goal <text>",
+            "/status",
+            "/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM",
+            "/show_universe",
+            "/show_pairs",
+            "/paper_tick",
+          ].join("\n"),
+        ),
+      );
+
+      // 🔧 Register /set_universe and /show_universe
+      await registerUniverseCommands(telegraf);
+
+      // 🔧 Register /show_pairs tracking debug command
+      await registerTrackingCommands(telegraf);
+
+      // 🔧 Register trading commands (paper tick)
+      await registerTradingCommands(telegraf);
 
       console.log("[telegram] starting…");
 
@@ -48,28 +283,39 @@ const telegramService = service({
           console.log("[telegram] launch() kicked off (polling).");
         })
         .catch((err) => {
-          console.error("[telegram] launch() error (continuing without Telegram):", err);
+          console.error(
+            "[telegram] launch() error (continuing without Telegram):",
+            err,
+          );
         });
 
       // Fire-and-forget readiness probe with timeout
       const getMeWithTimeout = Promise.race([
         telegraf.telegram.getMe(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("getMe timeout")), 7000)),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("getMe timeout")), 7000),
+        ),
       ]);
 
-      getMeWithTimeout
+      (getMeWithTimeout as Promise<any>)
         .then((info: any) => console.log("[telegram] bot ready:", info))
-        .catch((err) => console.warn("[telegram] getMe probe failed:", err));
+        .catch((err) =>
+          console.warn("[telegram] getMe probe failed:", err),
+        );
 
-      // graceful shutdown (these MUST be inside try/catch block but after launch)
+      // graceful shutdown
       process.once("SIGINT", () => telegraf.stop("SIGINT"));
       process.once("SIGTERM", () => telegraf.stop("SIGTERM"));
     } catch (err) {
-      console.error("[telegram] boot error (continuing without Telegram):", err);
+      console.error(
+        "[telegram] boot error (continuing without Telegram):",
+        err,
+      );
       // Do not throw — keep the worker alive even if Telegram fails to start.
     }
   },
 });
+
 
 const telegramChat = context({
   type: "telegram:chat",
@@ -86,7 +332,9 @@ const telegramChat = context({
   description({ options: { chat } }) {
     if (!chat) return "";
     if (chat.type === "private") {
-      return `Private Telegram chat with @${chat.username ?? "user"} (id ${chat.id}).`;
+      return `Private Telegram chat with @${
+        (chat as any).username ?? "user"
+      } (id ${chat.id}).`;
     }
     return "";
   },
@@ -99,7 +347,10 @@ function inferIntent(text: string) {
     /^\/goal\s+(.+)/i.exec(t) ||
     /^(?:set|update)\s+my\s+goal\s+to\s+['"]?(.+?)['"]?$/i.exec(t);
   if (goalMatch) return { intent: "setGoal", args: { task: goalMatch[1] } };
-  if (/^\/status\b/i.test(t) || /what'?s my (current )?goal\??/i.test(t))
+  if (
+    /^\/status\b/i.test(t) ||
+    /what'?s my (current )?goal\??/i.test(t)
+  )
     return { intent: "status", args: {} };
   return { intent: "message", args: {} };
 }
@@ -147,7 +398,7 @@ export const telegramExtension = extension({
             {
               user: { id: from.id, username: from.username ?? "user" },
               text: (ctx.message as any).text,
-            }
+            },
           );
         });
 
@@ -170,7 +421,9 @@ export const telegramExtension = extension({
         const telegraf = resolveOptional<Telegraf>(container, "telegraf");
         if (!telegraf) return { ok: false, error: "telegram disabled" };
 
-        const chunks = splitTextIntoChunks(data.content, { maxChunkSize: 4096 });
+        const chunks = splitTextIntoChunks(data.content, {
+          maxChunkSize: 4096,
+        });
         for (const chunk of chunks) {
           await telegraf.telegram.sendMessage(data.userId, chunk, {
             parse_mode: "Markdown",
