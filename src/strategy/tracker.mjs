@@ -2,36 +2,62 @@
 import { getUniverse } from "../state/watchlist.mjs";
 
 /**
+ * Normalize a value into a BigInt, safely handling what survives JSON:
+ * - string (e.g. "1000000000000000000")
+ * - number
+ * - bigint
+ * - null/undefined
+ */
+function normalizeBigInt(value) {
+  if (value === null || value === undefined) return 0n;
+
+  if (typeof value === "bigint") return value;
+
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return 0n;
+    return BigInt(s);
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return 0n;
+    return BigInt(Math.floor(value));
+  }
+
+  // Anything else (object, etc.) → treat as zero.
+  return 0n;
+}
+
+/**
  * Pick the best USDC pool for a token.
- * Strategy: highest liquidityBigInt > 0.
+ * Strategy: highest liquidity (liquidityBigInt or liquidity).
  */
 export function pickBestUsdcPoolForToken(token) {
   const allPools = Array.isArray(token.usdcPools) ? token.usdcPools : [];
 
-  const active = allPools.filter((p) => {
-    const liq =
-      p && typeof p.liquidityBigInt === "bigint"
-        ? p.liquidityBigInt
-        : 0n;
+  if (!allPools.length) return null;
+
+  const activePools = allPools.filter((p) => {
+    const liq = normalizeBigInt(
+      p?.liquidityBigInt !== undefined ? p.liquidityBigInt : p?.liquidity,
+    );
     return liq > 0n;
   });
 
-  if (!active.length) return null;
+  if (!activePools.length) return null;
 
-  active.sort((a, b) => {
-    const A =
-      a && typeof a.liquidityBigInt === "bigint"
-        ? a.liquidityBigInt
-        : 0n;
-    const B =
-      b && typeof b.liquidityBigInt === "bigint"
-        ? b.liquidityBigInt
-        : 0n;
+  activePools.sort((a, b) => {
+    const A = normalizeBigInt(
+      a?.liquidityBigInt !== undefined ? a.liquidityBigInt : a?.liquidity,
+    );
+    const B = normalizeBigInt(
+      b?.liquidityBigInt !== undefined ? b.liquidityBigInt : b?.liquidity,
+    );
     if (A === B) return 0;
     return A > B ? -1 : 1;
   });
 
-  return active[0];
+  return activePools[0];
 }
 
 /**
@@ -60,31 +86,31 @@ export async function buildTrackingSnapshot(chatId) {
     const allPools = Array.isArray(t.usdcPools) ? t.usdcPools : [];
 
     const activePools = allPools.filter((p) => {
-      const liq =
-        p && typeof p.liquidityBigInt === "bigint"
-          ? p.liquidityBigInt
-          : 0n;
+      const liq = normalizeBigInt(
+        p?.liquidityBigInt !== undefined ? p.liquidityBigInt : p?.liquidity,
+      );
       return liq > 0n;
     });
 
-    const bestPool = pickBestUsdcPoolForToken(t);
+    const bestPoolRaw = pickBestUsdcPoolForToken(t);
+
+    const bestPool = bestPoolRaw
+      ? {
+          keyHash: bestPoolRaw.keyHash,
+          fee: bestPoolRaw.fee,
+          tickSpacing: bestPoolRaw.tickSpacing,
+          liquidityBigInt: normalizeBigInt(
+            bestPoolRaw.liquidityBigInt ?? bestPoolRaw.liquidity,
+          ),
+        }
+      : null;
 
     return {
       symbol: t.symbol,
       address: t.address,
       totalUsdcPools: allPools.length,
       activeUsdcPools: activePools.length,
-      bestPool: bestPool
-        ? {
-            keyHash: bestPool.keyHash,
-            fee: bestPool.fee,
-            tickSpacing: bestPool.tickSpacing,
-            liquidityBigInt:
-              typeof bestPool.liquidityBigInt === "bigint"
-                ? bestPool.liquidityBigInt
-                : 0n,
-          }
-        : null,
+      bestPool,
     };
   });
 
