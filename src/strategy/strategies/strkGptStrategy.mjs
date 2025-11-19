@@ -2,14 +2,14 @@
 // -------------------------------------------------------------
 // Dependency-free STRK swing strategy.
 // Uses short vs long moving averages on the AVNU price feed.
-// No OpenAI / no external packages.
+// Tuned to be more *active* with a bootstrap first BUY.
 // -------------------------------------------------------------
 
 /**
  * ctx: {
  *   chatId,
  *   snapshot,
- *   priceData: [{ ts, price }],
+ *   priceData: [{ t, price }],
  *   latestPrice: number,
  *   position: { usdc, strk, latestPrice },
  *   now,
@@ -27,15 +27,17 @@ export async function strkGptStrategy(ctx) {
     return [];
   }
 
-  // Need at least 20 points for MA
-  if (prices.length < 20) {
+  // Need a minimum of points for MA logic
+  if (prices.length < 10) {
+    // not enough data yet, just hold
     return [];
   }
 
   const sma = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
-  const shortWindow = 5;
-  const longWindow = 20;
+  // More responsive windows
+  const shortWindow = 3;
+  const longWindow = 10;
 
   const shortMA = sma(prices.slice(-shortWindow));
   const longMA = sma(prices.slice(-longWindow));
@@ -48,12 +50,26 @@ export async function strkGptStrategy(ctx) {
   const strkUsd = strk * latestPrice;
 
   // Tunable knobs
-  const baseSizeUsd = 50;      // target trade size
-  const minRelDiff = 0.003;    // 0.3% threshold to act
+  const baseSizeUsd = 50;    // target trade size
+  const minRelDiff = 0.0005; // 0.05% threshold to act (more aggressive)
+
+  // 🔹 Bootstrap: if we have *no* STRK but have USDC, open an initial long
+  if (strkUsd < 1 && usdc >= 10) {
+    const sizeUsd = Math.min(usdc, baseSizeUsd);
+    return [
+      {
+        strategy: "ma-swing",
+        side: "BUY",
+        sizeUsd,
+        confidence: 0.5,
+        reason: "bootstrap: open initial STRK position with no existing holdings",
+      },
+    ];
+  }
 
   // BUY condition: short MA > long MA by threshold and we have USDC
   if (relDiff > minRelDiff && usdc >= 10) {
-    const strength = Math.min(1, relDiff / 0.01); // saturate at ~1% diff
+    const strength = Math.min(1, relDiff / 0.005); // saturate around 0.5% diff
     const sizeUsd = Math.min(usdc, baseSizeUsd * (0.5 + strength));
 
     return [
@@ -62,14 +78,14 @@ export async function strkGptStrategy(ctx) {
         side: "BUY",
         sizeUsd,
         confidence: strength,
-        reason: `short MA above long MA by ${(relDiff * 100).toFixed(2)}%`,
+        reason: `short MA above long MA by ${(relDiff * 100).toFixed(3)}%`,
       },
     ];
   }
 
   // SELL condition: short MA < long MA by threshold and we have STRK
   if (relDiff < -minRelDiff && strkUsd >= 10) {
-    const strength = Math.min(1, (-relDiff) / 0.01);
+    const strength = Math.min(1, (-relDiff) / 0.005);
     const sizeUsd = Math.min(strkUsd, baseSizeUsd * (0.5 + strength));
 
     return [
@@ -78,7 +94,7 @@ export async function strkGptStrategy(ctx) {
         side: "SELL",
         sizeUsd,
         confidence: strength,
-        reason: `short MA below long MA by ${(relDiff * 100).toFixed(2)}%`,
+        reason: `short MA below long MA by ${(relDiff * 100).toFixed(3)}%`,
       },
     ];
   }
