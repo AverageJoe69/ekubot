@@ -1,6 +1,6 @@
 // src/strategy/priceFeed.mjs
 // -------------------------------------------------------------
-// Live STRK/USDC price via AVNU swap/v2/quotes
+// Live STRK/USDC price via AVNU swap/v2/quotes, with warm-up
 // -------------------------------------------------------------
 
 import axios from "axios";
@@ -23,6 +23,7 @@ const USDC_DECIMALS = 6n;
 
 // In-memory price history
 const history = []; // [{ t: number, price: number }]
+const MIN_SEEDED_POINTS = 30;
 
 // -------------------------------------------------------------
 // Low-level AVNU fetch
@@ -62,9 +63,9 @@ async function fetchStrkUsdcPriceFromAvnu() {
 
   const buyAmountWei = BigInt(buyAmountHex);
 
-  // ❗ IMPORTANT: use floating point for decimal scaling,
-  // not integer BigInt division (which was giving us zero).
-  const buyUsdc = Number(buyAmountWei) / 10 ** Number(USDC_DECIMALS); // e.g. 0.83
+  // Use floating point for decimals
+  const buyUsdc =
+    Number(buyAmountWei) / 10 ** Number(USDC_DECIMALS); // e.g. 0.83
   const sellStrk = Number(ONE_STRK_WEI) / 10 ** 18; // exactly 1.0
 
   if (!Number.isFinite(buyUsdc) || buyUsdc <= 0) {
@@ -78,6 +79,27 @@ async function fetchStrkUsdcPriceFromAvnu() {
   }
 
   return price;
+}
+
+// -------------------------------------------------------------
+// Warm-up helper: seed synthetic history around a real price
+// -------------------------------------------------------------
+
+async function seedHistoryIfNeeded() {
+  if (history.length >= MIN_SEEDED_POINTS) return;
+
+  const basePrice = await fetchStrkUsdcPriceFromAvnu();
+  const now = Date.now();
+
+  history.length = 0; // reset
+
+  // Create 30 pseudo-historical points, 1 min apart, ±1% noise
+  for (let i = MIN_SEEDED_POINTS - 1; i >= 0; i--) {
+    const t = now - i * 60_000;
+    const jitterFactor = 1 + (Math.random() - 0.5) * 0.02; // ±1%
+    const price = basePrice * jitterFactor;
+    history.push({ t, price });
+  }
 }
 
 // -------------------------------------------------------------
@@ -102,6 +124,8 @@ export async function getLatestStrkPrice() {
 }
 
 export async function getStrkPriceHistory() {
+  // If we don't have enough history, seed it once
+  await seedHistoryIfNeeded();
   // shallow copy so callers can't mutate internal array
   return [...history];
 }
