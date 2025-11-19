@@ -17,23 +17,17 @@ const RAW_STRK_ADDRESS =
 
 export const STRK_ADDRESS = normalizeAddress(RAW_STRK_ADDRESS);
 
-// We’ll always ask: “what’s the best quote to SELL 1 STRK for USDC?”
+// We'll ask: "what's the best quote to SELL 1 STRK for USDC?"
 const ONE_STRK_WEI = 10n ** 18n; // STRK has 18 decimals
 const USDC_DECIMALS = 6n;
 
-// In-memory price history for the GPT strategy
+// In-memory price history
 const history = []; // [{ t: number, price: number }]
 
-/**
- * Low-level: fetch STRK/USDC execution price from AVNU.
- *
- * Uses GET /swap/v2/quotes with:
- *   sellTokenAddress = STRK
- *   buyTokenAddress  = USDC
- *   sellAmount       = 1 STRK (1e18)
- *
- * Returns: Number (USDC per 1 STRK)
- */
+// -------------------------------------------------------------
+// Low-level AVNU fetch
+// -------------------------------------------------------------
+
 async function fetchStrkUsdcPriceFromAvnu() {
   if (!STRK_ADDRESS || !USDC_ADDRESS) {
     throw new Error("STRK_ADDRESS or USDC_ADDRESS not configured");
@@ -44,8 +38,7 @@ async function fetchStrkUsdcPriceFromAvnu() {
   const params = {
     sellTokenAddress: STRK_ADDRESS,
     buyTokenAddress: USDC_ADDRESS,
-    // 1 STRK in wei, hex-encoded
-    sellAmount: "0x" + ONE_STRK_WEI.toString(16),
+    sellAmount: "0x" + ONE_STRK_WEI.toString(16), // 1 STRK, hex
   };
 
   const resp = await axios.get(url, {
@@ -61,7 +54,7 @@ async function fetchStrkUsdcPriceFromAvnu() {
 
   const entry = data[0];
 
-  // AVNU returns buyAmount as hex string, e.g. "0x1234..."
+  // AVNU returns buyAmount as hex string (USDC in smallest units)
   const buyAmountHex = entry.buyAmount || entry.buy_amount;
   if (!buyAmountHex) {
     throw new Error("AVNU quote missing buyAmount");
@@ -69,18 +62,16 @@ async function fetchStrkUsdcPriceFromAvnu() {
 
   const buyAmountWei = BigInt(buyAmountHex);
 
-  // Convert to token units:
-  // - we sold 1 STRK (ONE_STRK_WEI), so sell tokens = 1
-  // - USDC has 6 decimals: tokens = wei / 10^6
-  const buyUsdcTokens = buyAmountWei / 10n ** USDC_DECIMALS;
-  const sellStrkTokens = ONE_STRK_WEI / 10n ** 18n; // = 1n
+  // ❗ IMPORTANT: use floating point for decimal scaling,
+  // not integer BigInt division (which was giving us zero).
+  const buyUsdc = Number(buyAmountWei) / 10 ** Number(USDC_DECIMALS); // e.g. 0.83
+  const sellStrk = Number(ONE_STRK_WEI) / 10 ** 18; // exactly 1.0
 
-  if (sellStrkTokens === 0n) {
-    throw new Error("sellStrkTokens is zero (unexpected)");
+  if (!Number.isFinite(buyUsdc) || buyUsdc <= 0) {
+    throw new Error("AVNU buyAmount produced invalid USDC value");
   }
 
-  // USDC per STRK
-  const price = Number(buyUsdcTokens) / Number(sellStrkTokens);
+  const price = buyUsdc / sellStrk; // USDC per STRK
 
   if (!Number.isFinite(price) || price <= 0) {
     throw new Error("Computed invalid STRK/USDC price from AVNU");
@@ -89,19 +80,15 @@ async function fetchStrkUsdcPriceFromAvnu() {
   return price;
 }
 
-/**
- * Public: get latest STRK price (USDC per STRK).
- *
- * - Calls AVNU once
- * - Updates in-memory history
- * - Returns Number or null on failure
- */
+// -------------------------------------------------------------
+// Public API
+// -------------------------------------------------------------
+
 export async function getLatestStrkPrice() {
   try {
     const price = await fetchStrkUsdcPriceFromAvnu();
 
     history.push({ t: Date.now(), price });
-    // keep history reasonably small
     if (history.length > 500) history.shift();
 
     return price;
@@ -114,10 +101,7 @@ export async function getLatestStrkPrice() {
   }
 }
 
-/**
- * Public: return a shallow copy of the price history.
- * Shape: [{ t: number, price: number }, ...]
- */
 export async function getStrkPriceHistory() {
+  // shallow copy so callers can't mutate internal array
   return [...history];
 }
