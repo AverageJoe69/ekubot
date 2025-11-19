@@ -1,131 +1,164 @@
 // src/strategy/priceFeed.mjs
-// -------------------------------------------------------------
-// Live STRK/USDC price via AVNU swap/v2/quotes, with warm-up
-// -------------------------------------------------------------
-
 import axios from "axios";
-import { normalizeAddress, USDC_ADDRESS } from "../utils/ekubo.mjs";
 
-// AVNU base URL
-const AVNU_BASE_URL =
-  process.env.AVNU_BASE_URL || "https://starknet.api.avnu.fi";
+const AVNU_PRICE_URL =
+  process.env.AVNU_PRICE_URL ||
+  "https://api.avnu.fi/prices/v1"; // adjust to your real endpoint
 
-// STRK address (same as ekubo.mjs default)
-const RAW_STRK_ADDRESS =
+// STRK + USDC addresses on Starknet (you already have these somewhere)
+const STRK_ADDRESS =
   process.env.STRK_ADDRESS ||
-  "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
+  "0x04718f5b6d53dfddc0e6c1a1519b1f34b1ba6c2bda9ded0c77c4a3a0c938d"; // example
+const USDC_ADDRESS =
+  process.env.USDC_ADDRESS ||
+  "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8";
 
-export const STRK_ADDRESS = normalizeAddress(RAW_STRK_ADDRESS);
+// --- Candle state (in-memory) ---------------------------------------------
 
-// We'll ask: "what's the best quote to SELL 1 STRK for USDC?"
-const ONE_STRK_WEI = 10n ** 18n; // STRK has 18 decimals
-const USDC_DECIMALS = 6n;
+const MS_PER_MIN = 60_000;
+const MAX_CANDLES = 500; // ~8 hours of 1m candles
 
-// In-memory price history
-const history = []; // [{ t: number, price: number }]
-const MIN_SEEDED_POINTS = 30;
+let currentCandle = null; // { startTs, open, high, low, close }
+let candleHistory = [];   // array of closed candles
 
-// -------------------------------------------------------------
-// Low-level AVNU fetch
-// -------------------------------------------------------------
+function floorToMinute(tsMs) {
+  return Math.floor(tsMs / MS_PER_MIN) * MS_PER_MIN;
+}
 
-async function fetchStrkUsdcPriceFromAvnu() {
-  if (!STRK_ADDRESS || !USDC_ADDRESS) {
-    throw new Error("STRK_ADDRESS or USDC_ADDRESS not configured");
+/**
+ * Update / create the 1-minute candle for this tick.
+ */
+function updateStrkCandles(tsMs, price) {
+  const bucketStart = floorToMinute(tsMs);
+
+  if (!currentCandle || currentCandle.startTs !== bucketStart) {
+    // Close previous candle if present
+    if (currentCandle) {
+      candleHistory.push(currentCandle);
+      if (candleHistory.length > MAX_CANDLES) {
+        candleHistory.shift();
+      }
+    }
+
+    // Start a new candle
+    currentCandle = {
+      startTs: bucketStart,
+      open: price,
+      high: price,
+      low: price,
+      close: price,
+    };
+  } else {
+    // Update running candle
+    if (price > currentCandle.high) currentCandle.high = price;
+    if (price < currentCandle.low) currentCandle.low = price;
+    currentCandle.close = price;
+  }
+}
+
+/**
+ * Returns an array of candles (oldest → newest) for the requested lookback.
+ * Each element:
+ * { ts, price, o, h, l, c }
+ *
+ * - ts: candle start timestamp (ms)
+ * - price: alias for close (backwards compatible)
+ * - o/h/l/c: OHLC
+ */
+export function getStrkPriceHistory({ lookbackMinutes = 120 } = {}) {
+  const cutoff = Date.now() - lookbackMinutes * MS_PER_MIN;
+
+  const result = [];
+
+  for (const c of candleHistory) {
+    if (c.startTs >= cutoff) {
+      result.push({
+        ts: c.startTs,
+        price: c.close,
+        o: c.open,
+        h: c.high,
+        l: c.low,
+        c: c.close,
+      });
+    }
   }
 
-  const url = `${AVNU_BASE_URL}/swap/v2/quotes`;
+  if (currentCandle && currentCandle.startTs >= cutoff) {
+    result.push({
+      ts: currentCandle.startTs,
+      price: currentCandle.close,
+      o: currentCandle.open,
+      h: currentCandle.high,
+      l: currentCandle.low,
+      c: currentCandle.close,
+    });
+  }
 
-  const params = {
-    sellTokenAddress: STRK_ADDRESS,
-    buyTokenAddress: USDC_ADDRESS,
-    sellAmount: "0x" + ONE_STRK_WEI.toString(16), // 1 STRK, hex
-  };
+  return result;
+}
 
-  const resp = await axios.get(url, {
-    params,
-    timeout: 7000,
+// --- AVNU fetch + latest price --------------------------------------------
+
+async function fetchLatestStrkPriceFromAvnu() {
+  // Adjust to match your real AVNU call signature.
+  // This is deliberately generic; you likely already have something similar.
+  const res = await axios.get(AVNU_PRICE_URL, {
+    params: {
+      // Example query; replace with your real params
+      // e.g. base=STRK, quote=USDC, or tokenAddress, etc.
+      baseToken: STRK_ADDRESS,
+      quoteToken: USDC_ADDRESS,
+    },
+    timeout: 10_000,
   });
 
-  const data = resp.data;
+  const data = res.data;
 
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error("AVNU returned no quotes for STRK/USDC");
-  }
-
-  const entry = data[0];
-
-  // AVNU returns buyAmount as hex string (USDC in smallest units)
-  const buyAmountHex = entry.buyAmount || entry.buy_amount;
-  if (!buyAmountHex) {
-    throw new Error("AVNU quote missing buyAmount");
-  }
-
-  const buyAmountWei = BigInt(buyAmountHex);
-
-  // Use floating point for decimals
-  const buyUsdc =
-    Number(buyAmountWei) / 10 ** Number(USDC_DECIMALS); // e.g. 0.83
-  const sellStrk = Number(ONE_STRK_WEI) / 10 ** 18; // exactly 1.0
-
-  if (!Number.isFinite(buyUsdc) || buyUsdc <= 0) {
-    throw new Error("AVNU buyAmount produced invalid USDC value");
-  }
-
-  const price = buyUsdc / sellStrk; // USDC per STRK
+  // Normalise to a float STRK/USDC price
+  // If your API returns something else, just tweak this mapping.
+  const price =
+    typeof data.price === "number"
+      ? data.price
+      : parseFloat(data.price ?? "0");
 
   if (!Number.isFinite(price) || price <= 0) {
-    throw new Error("Computed invalid STRK/USDC price from AVNU");
+    throw new Error(`Invalid STRK price from AVNU: ${JSON.stringify(data)}`);
   }
 
+  return {
+    price,
+    ts: Date.now(),
+  };
+}
+
+/**
+ * Main entry point used by the rest of the bot.
+ *
+ * - Fetches latest STRK/USDC price from AVNU.
+ * - Updates the in-memory candle engine.
+ * - Returns a simple float price (backwards compatible).
+ */
+export async function getLatestStrkPrice() {
+  const { price, ts } = await fetchLatestStrkPriceFromAvnu();
+  updateStrkCandles(ts, price);
   return price;
 }
 
-// -------------------------------------------------------------
-// Warm-up helper: seed synthetic history around a real price
-// -------------------------------------------------------------
+/**
+ * Optional helper if you ever want raw candle objects (not just mapped history).
+ * Not used by existing code, but handy for debugging / plotting later.
+ */
+export function getStrkCandlesRaw({ lookbackMinutes = 120 } = {}) {
+  const cutoff = Date.now() - lookbackMinutes * MS_PER_MIN;
 
-async function seedHistoryIfNeeded() {
-  if (history.length >= MIN_SEEDED_POINTS) return;
+  const result = [];
 
-  const basePrice = await fetchStrkUsdcPriceFromAvnu();
-  const now = Date.now();
-
-  history.length = 0; // reset
-
-  // Create 30 pseudo-historical points, 1 min apart, ±1% noise
-  for (let i = MIN_SEEDED_POINTS - 1; i >= 0; i--) {
-    const t = now - i * 60_000;
-    const jitterFactor = 1 + (Math.random() - 0.5) * 0.02; // ±1%
-    const price = basePrice * jitterFactor;
-    history.push({ t, price });
+  for (const c of candleHistory) {
+    if (c.startTs >= cutoff) result.push({ ...c });
   }
-}
-
-// -------------------------------------------------------------
-// Public API
-// -------------------------------------------------------------
-
-export async function getLatestStrkPrice() {
-  try {
-    const price = await fetchStrkUsdcPriceFromAvnu();
-
-    history.push({ t: Date.now(), price });
-    if (history.length > 500) history.shift();
-
-    return price;
-  } catch (err) {
-    console.error(
-      "[priceFeed] AVNU STRK/USDC price fetch failed:",
-      err?.message || err,
-    );
-    return null;
+  if (currentCandle && currentCandle.startTs >= cutoff) {
+    result.push({ ...currentCandle });
   }
-}
 
-export async function getStrkPriceHistory() {
-  // If we don't have enough history, seed it once
-  await seedHistoryIfNeeded();
-  // shallow copy so callers can't mutate internal array
-  return [...history];
+  return result;
 }

@@ -1,6 +1,7 @@
 // src/strategy/trading.mjs
 // -------------------------------------------------------------
-// STRK-only trading loop (paper + future live)
+// STRK-only trading loop (paper + future live) with 1-minute
+// auto-trading support + candle-based price history.
 // -------------------------------------------------------------
 
 import { strkGptStrategy } from "./strategies/strkGptStrategy.mjs";
@@ -12,8 +13,8 @@ import {
 // In-memory per-chat state (paper positions & config)
 // NOTE: this resets on process restart – fine for now.
 const positions = new Map(); // chatId -> { usdc, strk }
-const configs = new Map();   // chatId -> { mode: "paper"|"live", enabled: boolean }
-const riskState = new Map(); // chatId -> { lastBuyPrice: number | null }
+const configs = new Map();   // chatId -> { mode, liveEnabled, autoEnabled }
+const lastAutoRun = new Map(); // chatId -> "YYYY-MM-DDTHH:MM"
 
 function chatKey(chatId) {
   return String(chatId);
@@ -37,127 +38,53 @@ function ensureConfig(chatId) {
   let cfg = configs.get(key);
   if (!cfg) {
     cfg = {
-      mode: "paper",
-      enabled: false,
+      mode: "paper",    // "paper" | "live"
+      liveEnabled: false,
+      autoEnabled: false,
     };
     configs.set(key, cfg);
   }
   return cfg;
 }
 
-function ensureRisk(chatId) {
-  const key = chatKey(chatId);
-  let rs = riskState.get(key);
-  if (!rs) {
-    rs = { lastBuyPrice: null };
-    riskState.set(key, rs);
-  }
-  return rs;
-}
-
 // -------------------------------------------------------------
 // Core tick
 // -------------------------------------------------------------
-
-// Simple risk knobs for now
-const TAKE_PROFIT_PCT = 0.02; // +2% → take profit
-const STOP_LOSS_PCT   = 0.01; // -1% → stop loss
 
 /**
  * tradeTick(chatId, { mode })
  * mode = "paper" | "live"
  */
 export async function tradeTick(chatId, { mode = "paper" } = {}) {
-  const now = new Date().toISOString();
+  const nowIso = new Date().toISOString();
 
   const cfg = ensureConfig(chatId);
   const pos = ensurePosition(chatId);
-  const risk = ensureRisk(chatId);
 
-  // 1. Price data
-  const priceData = await getStrkPriceHistory();
+  // Keep config mode in sync with explicit mode argument
+  cfg.mode = mode;
+  configs.set(chatKey(chatId), cfg);
+
+  // 1. Latest price (also updates candle engine via priceFeed.mjs)
   const latestPrice = await getLatestStrkPrice();
 
-  if (!latestPrice || latestPrice <= 0) {
-    return {
-      updatedAt: now,
-      mode,
-      price: latestPrice,
-      intents: [],
-      position: { ...pos },
-      notes: "Latest STRK price unavailable, holding.",
-    };
-  }
+  // 2. Candle-based price history (1m candles mapped to { ts, price, o, h, l, c })
+  const priceData = getStrkPriceHistory({ lookbackMinutes: 240 });
 
-  const strkUsd = pos.strk * latestPrice;
-  let intents = [];
-
-  // 2. Risk management: take-profit / stop-loss
-  if (pos.strk > 0 && risk.lastBuyPrice && risk.lastBuyPrice > 0) {
-    const entry = risk.lastBuyPrice;
-    const change = (latestPrice - entry) / entry;
-
-    if (change >= TAKE_PROFIT_PCT) {
-      // Take profit: close full position
-      const sizeUsd = strkUsd;
-      intents.push({
-        strategy: "risk-mgmt",
-        side: "SELL",
-        sizeUsd,
-        confidence: 1.0,
-        reason: `take-profit: price ${(change * 100).toFixed(2)}% above entry (${entry.toFixed(
-          4,
-        )} → ${latestPrice.toFixed(4)})`,
-      });
-    } else if (change <= -STOP_LOSS_PCT) {
-      // Stop loss: close full position
-      const sizeUsd = strkUsd;
-      intents.push({
-        strategy: "risk-mgmt",
-        side: "SELL",
-        sizeUsd,
-        confidence: 1.0,
-        reason: `stop-loss: price ${(change * 100).toFixed(2)}% below entry (${entry.toFixed(
-          4,
-        )} → ${latestPrice.toFixed(4)})`,
-      });
-    }
-  }
-
-  // 3. If no risk intent, ask strategy (MA-based swing)
-  if (!intents.length) {
-    const snapshot = {
-      tokens: [
-        {
-          symbol: "STRK",
-          address: "0x4718f5...", // synthetic; not used for pricing
-          bestPool: {
-            keyHash: "STRK/USDC",
-            fee: "0x0",
-            tickSpacing: "0x0",
-            liquidityBigInt: 1000000000000000000n,
-          },
-        },
-      ],
-    };
-
-    const stratIntents = await strkGptStrategy({
-      chatId,
-      snapshot,
-      priceData,
-      latestPrice,
-      position: { ...pos, latestPrice },
-      now,
-      mode,
-    });
-
-    intents = stratIntents || [];
-  }
+  // 3. Ask strategy what to do
+  const intents = await strkGptStrategy({
+    chatId,
+    priceData,
+    latestPrice,
+    position: { ...pos, latestPrice },
+    now: nowIso,
+    mode,
+  });
 
   // 4. No intent → HOLD
-  if (!intents.length) {
+  if (!intents || !intents.length) {
     return {
-      updatedAt: now,
+      updatedAt: nowIso,
       mode,
       price: latestPrice,
       intents: [],
@@ -166,16 +93,14 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     };
   }
 
-  // For now we only ever apply the first intent.
   const intent = intents[0];
 
+  // 5. Apply paper mode
   if (mode === "paper") {
-    applyPaperTrade(pos, intent, latestPrice, risk);
+    applyPaperTrade(pos, intent, latestPrice);
     positions.set(chatKey(chatId), pos);
-    riskState.set(chatKey(chatId), risk);
-
     return {
-      updatedAt: now,
+      updatedAt: nowIso,
       mode,
       price: latestPrice,
       intents: [intent],
@@ -183,10 +108,11 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     };
   }
 
+  // 6. Live (future)
   if (mode === "live") {
-    // TODO: wire real Ekubo/AVNU swap here later
+    // TODO: wire real Ekubo swap via AVNU later
     return {
-      updatedAt: now,
+      updatedAt: nowIso,
       mode,
       price: latestPrice,
       intents: [intent],
@@ -195,8 +121,9 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     };
   }
 
+  // Fallback
   return {
-    updatedAt: now,
+    updatedAt: nowIso,
     mode,
     price: latestPrice,
     intents: [],
@@ -205,38 +132,28 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
   };
 }
 
-function applyPaperTrade(position, intent, latestPrice, risk) {
+function applyPaperTrade(position, intent, latestPrice) {
   const side = intent.side;
   const sizeUsd = Number(intent.sizeUsd || 0);
 
-  if (sizeUsd <= 0 || latestPrice <= 0) return;
+  if (!latestPrice || latestPrice <= 0) return;
+  if (sizeUsd <= 0) return;
 
   if (side === "BUY") {
     if (position.usdc >= sizeUsd) {
       const strkAmount = sizeUsd / latestPrice;
       position.usdc -= sizeUsd;
       position.strk += strkAmount;
-
-      // Update last entry price to this buy
-      risk.lastBuyPrice = latestPrice;
     }
   }
 
   if (side === "SELL") {
     const maxSellUsd = position.strk * latestPrice;
     if (maxSellUsd <= 0) return;
-
     const sellUsd = Math.min(sizeUsd, maxSellUsd);
     const strkToSell = sellUsd / latestPrice;
-
     position.strk -= strkToSell;
     position.usdc += sellUsd;
-
-    // If we've effectively closed the position, clear lastBuyPrice
-    if (position.strk <= 1e-9) {
-      position.strk = 0;
-      risk.lastBuyPrice = null;
-    }
   }
 }
 
@@ -245,7 +162,7 @@ function applyPaperTrade(position, intent, latestPrice, risk) {
 // -------------------------------------------------------------
 
 export async function getTradingStatus(chatId) {
-  const now = new Date().toISOString();
+  const nowIso = new Date().toISOString();
   const cfg = ensureConfig(chatId);
   const pos = ensurePosition(chatId);
   const latestPrice = await getLatestStrkPrice();
@@ -254,9 +171,10 @@ export async function getTradingStatus(chatId) {
 
   return {
     chatId: chatKey(chatId),
-    updatedAt: now,
+    updatedAt: nowIso,
     mode: cfg.mode,
-    enabled: cfg.enabled,
+    autoEnabled: cfg.autoEnabled,
+    liveEnabled: cfg.liveEnabled,
     price: latestPrice,
     position: { ...pos },
     equity,
@@ -266,7 +184,14 @@ export async function getTradingStatus(chatId) {
 export function setLiveMode(chatId, live) {
   const cfg = ensureConfig(chatId);
   cfg.mode = live ? "live" : "paper";
-  cfg.enabled = live;
+  cfg.liveEnabled = live;
+  configs.set(chatKey(chatId), cfg);
+  return cfg;
+}
+
+export function setAutoMode(chatId, auto) {
+  const cfg = ensureConfig(chatId);
+  cfg.autoEnabled = auto;
   configs.set(chatKey(chatId), cfg);
   return cfg;
 }
@@ -278,7 +203,6 @@ export function setLiveMode(chatId, live) {
 export async function stopAndFlatten(chatId) {
   const cfg = ensureConfig(chatId);
   const pos = ensurePosition(chatId);
-  const risk = ensureRisk(chatId);
   const latestPrice = await getLatestStrkPrice();
 
   const realizedUsd = pos.strk * (latestPrice || 0);
@@ -286,13 +210,13 @@ export async function stopAndFlatten(chatId) {
   pos.usdc += realizedUsd;
   pos.strk = 0;
 
+  // Always fall back to paper + auto off + live off
   cfg.mode = "paper";
-  cfg.enabled = false;
-  risk.lastBuyPrice = null;
+  cfg.liveEnabled = false;
+  cfg.autoEnabled = false;
 
   positions.set(chatKey(chatId), pos);
   configs.set(chatKey(chatId), cfg);
-  riskState.set(chatKey(chatId), risk);
 
   return {
     chatId: chatKey(chatId),
@@ -300,8 +224,53 @@ export async function stopAndFlatten(chatId) {
     realizedUsd,
     position: { ...pos },
     mode: cfg.mode,
-    enabled: cfg.enabled,
+    autoEnabled: cfg.autoEnabled,
+    liveEnabled: cfg.liveEnabled,
     updatedAt: new Date().toISOString(),
+  };
+}
+
+// -------------------------------------------------------------
+// Auto-trading: 1-minute logic
+// -------------------------------------------------------------
+
+/**
+ * autoTradeTick(chatId)
+ *
+ * Called from telegram.ts once per minute.
+ * - Respects /auto_on and /auto_off via setAutoMode
+ * - Ensures at most one tick per *minute* per chat
+ */
+export async function autoTradeTick(chatId) {
+  const cfg = ensureConfig(chatId);
+
+  if (!cfg.autoEnabled) {
+    return { autoRan: false, reason: "auto-disabled" };
+  }
+
+  const key = chatKey(chatId);
+  const now = new Date();
+  const minuteKey = now.toISOString().slice(0, 16); // "YYYY-MM-DDTHH:MM"
+
+  const lastKey = lastAutoRun.get(key);
+  if (lastKey === minuteKey) {
+    // Already ran for this chat in this minute
+    return { autoRan: false, reason: "already-ran-this-minute" };
+  }
+
+  lastAutoRun.set(key, minuteKey);
+
+  // Use current mode (paper/live) from config
+  const mode = cfg.mode || "paper";
+  const result = await tradeTick(chatId, { mode });
+  const message = formatPaperTickMessage(result);
+
+  return {
+    autoRan: true,
+    mode,
+    minuteKey,
+    result,
+    message,
   };
 }
 
@@ -315,7 +284,9 @@ export function formatPaperTickMessage(result) {
   lines.push(
     `🤖 Paper trade tick (mode: ${result.mode})`,
     `Time: ${result.updatedAt}`,
-    `STRK/USDC price: ${result.price?.toFixed?.(4) ?? result.price}`,
+    `STRK/USDC price: ${
+      result.price?.toFixed?.(4) ?? (result.price ?? "n/a")
+    }`,
     `Trade intents this tick: ${result.intents.length}`,
     "",
   );
@@ -348,7 +319,14 @@ export function formatPaperTickMessage(result) {
 }
 
 export function formatStatusMessage(status) {
-  const { mode, enabled, price, position, equity, updatedAt } = status;
+  const {
+    mode,
+    autoEnabled,
+    price,
+    position,
+    equity,
+    updatedAt,
+  } = status;
   const usdc = position.usdc.toFixed(2);
   const strk = position.strk.toFixed(6);
   const strkUsd = (position.strk * (price || 0)).toFixed(2);
@@ -358,9 +336,9 @@ export function formatStatusMessage(status) {
     `Time: ${updatedAt}`,
     "",
     `Mode: ${mode.toUpperCase()}`,
-    `Auto trading enabled: ${enabled ? "YES" : "NO"}`,
+    `Auto trading enabled: ${autoEnabled ? "YES" : "NO"}`,
     "",
-    `STRK/USDC price: ${price?.toFixed?.(4) ?? price}`,
+    `STRK/USDC price: ${price?.toFixed?.(4) ?? (price ?? "n/a")}`,
     "",
     "Balances:",
     `• USDC: ${usdc}`,
@@ -375,18 +353,20 @@ export function formatModeChangeMessage(cfg) {
     "⚙️ Trading mode updated",
     "",
     `Mode: ${cfg.mode.toUpperCase()}`,
-    `Auto trading enabled: ${cfg.enabled ? "YES" : "NO"}`,
+    `Auto trading enabled: ${cfg.autoEnabled ? "YES" : "NO"}`,
   ].join("\n");
 }
 
 export function formatStopAndFlattenMessage(res) {
-  const { price, realizedUsd, position, mode, enabled, updatedAt } = res;
+  const { price, realizedUsd, position, mode, autoEnabled, updatedAt } = res;
 
   return [
     "🛑 Trading halted and position flattened.",
     `Time: ${updatedAt}`,
     "",
-    `Sold all STRK to USDC at price: ${price?.toFixed?.(4) ?? price}`,
+    `Sold all STRK to USDC at price: ${
+      price?.toFixed?.(4) ?? (price ?? "n/a")
+    }`,
     `USDC realized from STRK: $${realizedUsd.toFixed(2)}`,
     "",
     "New balances:",
@@ -394,6 +374,6 @@ export function formatStopAndFlattenMessage(res) {
     `• STRK: ${position.strk.toFixed(6)}`,
     "",
     `Mode: ${mode.toUpperCase()}`,
-    `Auto trading enabled: ${enabled ? "YES" : "NO"}`,
+    `Auto trading enabled: ${autoEnabled ? "YES" : "NO"}`,
   ].join("\n");
 }
