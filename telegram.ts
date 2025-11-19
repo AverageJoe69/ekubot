@@ -211,8 +211,8 @@ async function registerTradingCommands(telegraf: Telegraf) {
     }
   });
 
-  // /auto_on → enable hourly auto trading
-  telegraf.command("auto_on", async (ctx) => {
+  // /auto_on → enable 1-minute auto trading
+telegraf.command("auto_on", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
       autoChats.add(chatId);
@@ -222,7 +222,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
           "🔁 Auto trading enabled for this chat.",
           "",
           `Mode: ${cfg.mode.toUpperCase()}`,
-          "The bot will run one tick each hour when a new candle prints.",
+          "The bot will run one tick each minute while auto mode is ON.",
         ].join("\n"),
         { parse_mode: "Markdown" },
       );
@@ -231,8 +231,8 @@ async function registerTradingCommands(telegraf: Telegraf) {
       await ctx.reply("❌ Failed to enable auto trading. Check logs.");
     }
   });
-
-  // /auto_off → disable hourly auto trading
+  
+  // /auto_off → disable 1-minute auto trading
   telegraf.command("auto_off", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -251,8 +251,8 @@ async function registerTradingCommands(telegraf: Telegraf) {
       await ctx.reply("❌ Failed to disable auto trading. Check logs.");
     }
   });
-
-  // 🔁 Auto loop: once per minute, run at most one tick per hour per chat
+  
+  // 🔁 Auto loop: once per minute, at most one tick per minute per chat
   setInterval(async () => {
     try {
       for (const chatId of autoChats) {
@@ -271,8 +271,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
       console.error("[telegram:auto-loop] error:", err);
     }
   }, 60_000);
-}
-
+}  
 // -------------------------------------------------------------
 // Command registration: universe / watchlist
 // -------------------------------------------------------------
