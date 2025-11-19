@@ -1,7 +1,7 @@
 // src/strategy/trading.mjs
 // -------------------------------------------------------------
 // STRK-only trading loop (paper + future live) with 1-minute
-// auto-trading support + candle-based price history.
+// auto-trading support.
 // -------------------------------------------------------------
 
 import { strkGptStrategy } from "./strategies/strkGptStrategy.mjs";
@@ -65,13 +65,11 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
   cfg.mode = mode;
   configs.set(chatKey(chatId), cfg);
 
-  // 1. Latest price (also updates candle engine via priceFeed.mjs)
+  // 1. Price data (keeps original async contract)
+  const priceData = await getStrkPriceHistory();
   const latestPrice = await getLatestStrkPrice();
 
-  // 2. Candle-based price history (1m candles mapped to { ts, price, o, h, l, c })
-  const priceData = getStrkPriceHistory({ lookbackMinutes: 240 });
-
-  // 3. Ask strategy what to do
+  // 2. Ask strategy what to do
   const intents = await strkGptStrategy({
     chatId,
     priceData,
@@ -81,7 +79,7 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     mode,
   });
 
-  // 4. No intent → HOLD
+  // 3. No intent → HOLD
   if (!intents || !intents.length) {
     return {
       updatedAt: nowIso,
@@ -95,7 +93,7 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
 
   const intent = intents[0];
 
-  // 5. Apply paper mode
+  // 4. Apply paper mode
   if (mode === "paper") {
     applyPaperTrade(pos, intent, latestPrice);
     positions.set(chatKey(chatId), pos);
@@ -108,7 +106,7 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     };
   }
 
-  // 6. Live (future)
+  // 5. Live (future)
   if (mode === "live") {
     // TODO: wire real Ekubo swap via AVNU later
     return {
