@@ -3,7 +3,7 @@
 // STRK-only trading loop (paper + future live)
 // -------------------------------------------------------------
 
-import { baseStrategy } from "./strategies/base.mjs";
+import { strkGptStrategy } from "./strategies/strkGptStrategy.mjs";
 import {
   getStrkPriceHistory,
   getLatestStrkPrice,
@@ -63,7 +63,7 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
       tokens: [
         {
           symbol: "STRK",
-          address: "0x4718f5...", // ← optional, safe either way
+          address: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
           bestPool: {
             keyHash: "STRK/USDC",
             fee: "0x0",
@@ -75,8 +75,8 @@ export async function tradeTick(chatId, { mode = "paper" } = {}) {
     };
   
     // 3. Ask strategy
-    const intents = await baseStrategy({
-      chatId,
+    const intents = await strkGptStrategy({
+        chatId,
       snapshot,       // ← FIXED: strategy now works again
       priceData,
       latestPrice,
