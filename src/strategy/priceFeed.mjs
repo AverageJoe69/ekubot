@@ -1,188 +1,131 @@
 // src/strategy/priceFeed.mjs
 // -------------------------------------------------------------
-// STRK/USDC price feed via AVNU + simple 1m candle engine.
-// Designed to be resilient: network errors do NOT throw,
-// they fall back to the last known price or 0.
+// Live STRK/USDC price via AVNU swap/v2/quotes, with warm-up
 // -------------------------------------------------------------
 
 import axios from "axios";
+import { normalizeAddress, USDC_ADDRESS } from "../utils/ekubo.mjs";
 
-const AVNU_PRICE_URL =
-  process.env.AVNU_PRICE_URL || "https://api.avnu.fi/prices/v1";
+// AVNU base URL
+const AVNU_BASE_URL =
+  process.env.AVNU_BASE_URL || "https://starknet.api.avnu.fi";
 
-// These are the working STRK/USDC addresses you were already using.
-// If env vars are set, they win; otherwise we fall back to constants.
-const STRK_ADDRESS =
+// STRK address (same as ekubo.mjs default)
+const RAW_STRK_ADDRESS =
   process.env.STRK_ADDRESS ||
-  "0x04718f5b6d53dfddc0e6c1a1519b1f34b1ba6c2bda9ded0c77c4a3a0c938d";
+  "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
-const USDC_ADDRESS =
-  process.env.USDC_ADDRESS ||
-  "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8";
+export const STRK_ADDRESS = normalizeAddress(RAW_STRK_ADDRESS);
 
-// ---- Candle state (in-memory) -----------------------------------------
+// We'll ask: "what's the best quote to SELL 1 STRK for USDC?"
+const ONE_STRK_WEI = 10n ** 18n; // STRK has 18 decimals
+const USDC_DECIMALS = 6n;
 
-const MS_PER_MIN = 60_000;
-const MAX_CANDLES = 500; // ~8h of 1m candles
+// In-memory price history
+const history = []; // [{ t: number, price: number }]
+const MIN_SEEDED_POINTS = 30;
 
-let currentCandle = null; // { startTs, open, high, low, close }
-let candleHistory = [];   // array of closed candles
-let lastKnownPrice = null;
+// -------------------------------------------------------------
+// Low-level AVNU fetch
+// -------------------------------------------------------------
 
-function floorToMinute(tsMs) {
-  return Math.floor(tsMs / MS_PER_MIN) * MS_PER_MIN;
-}
-
-function updateStrkCandles(tsMs, price) {
-  const bucketStart = floorToMinute(tsMs);
-
-  if (!currentCandle || currentCandle.startTs !== bucketStart) {
-    // Close previous candle
-    if (currentCandle) {
-      candleHistory.push(currentCandle);
-      if (candleHistory.length > MAX_CANDLES) {
-        candleHistory.shift();
-      }
-    }
-
-    currentCandle = {
-      startTs: bucketStart,
-      open: price,
-      high: price,
-      low: price,
-      close: price,
-    };
-  } else {
-    if (price > currentCandle.high) currentCandle.high = price;
-    if (price < currentCandle.low) currentCandle.low = price;
-    currentCandle.close = price;
+async function fetchStrkUsdcPriceFromAvnu() {
+  if (!STRK_ADDRESS || !USDC_ADDRESS) {
+    throw new Error("STRK_ADDRESS or USDC_ADDRESS not configured");
   }
-}
 
-// ---- AVNU fetch with graceful fallback --------------------------------
+  const url = `${AVNU_BASE_URL}/swap/v2/quotes`;
 
-async function fetchLatestStrkPriceFromAvnu() {
-  const ts = Date.now();
+  const params = {
+    sellTokenAddress: STRK_ADDRESS,
+    buyTokenAddress: USDC_ADDRESS,
+    sellAmount: "0x" + ONE_STRK_WEI.toString(16), // 1 STRK, hex
+  };
 
-  try {
-    const res = await axios.get(AVNU_PRICE_URL, {
-      params: {
-        baseToken: STRK_ADDRESS,
-        quoteToken: USDC_ADDRESS,
-      },
-      timeout: 10_000,
-    });
+  const resp = await axios.get(url, {
+    params,
+    timeout: 7000,
+  });
 
-    const data = res.data;
+  const data = resp.data;
 
-    // Normalise price
-    const raw = data?.price ?? data?.[0]?.price ?? data;
-    const price =
-      typeof raw === "number"
-        ? raw
-        : parseFloat(raw ?? "0");
-
-    if (!Number.isFinite(price) || price <= 0) {
-      console.error(
-        "[priceFeed] Invalid STRK price from AVNU:",
-        JSON.stringify(data).slice(0, 200),
-      );
-      // fall back to last known or 0
-      return {
-        price: lastKnownPrice ?? 0,
-        ts,
-      };
-    }
-
-    lastKnownPrice = price;
-    return { price, ts };
-  } catch (err) {
-    // This is where your ECONNREFUSED is coming from.
-    console.error(
-      "[priceFeed] AVNU price fetch failed:",
-      err?.code || err?.message || err,
-    );
-
-    // If we've ever had a good price, reuse it.
-    if (lastKnownPrice != null) {
-      return { price: lastKnownPrice, ts };
-    }
-
-    // Otherwise, return 0 so callers don't explode.
-    return { price: 0, ts };
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("AVNU returned no quotes for STRK/USDC");
   }
-}
 
-// ---- Public API --------------------------------------------------------
+  const entry = data[0];
 
-/**
- * Fetches the latest STRK/USDC price from AVNU, updates the candle engine,
- * and returns a float price. Never throws.
- */
-export async function getLatestStrkPrice() {
-  const { price, ts } = await fetchLatestStrkPriceFromAvnu();
-  updateStrkCandles(ts, price);
+  // AVNU returns buyAmount as hex string (USDC in smallest units)
+  const buyAmountHex = entry.buyAmount || entry.buy_amount;
+  if (!buyAmountHex) {
+    throw new Error("AVNU quote missing buyAmount");
+  }
+
+  const buyAmountWei = BigInt(buyAmountHex);
+
+  // Use floating point for decimals
+  const buyUsdc =
+    Number(buyAmountWei) / 10 ** Number(USDC_DECIMALS); // e.g. 0.83
+  const sellStrk = Number(ONE_STRK_WEI) / 10 ** 18; // exactly 1.0
+
+  if (!Number.isFinite(buyUsdc) || buyUsdc <= 0) {
+    throw new Error("AVNU buyAmount produced invalid USDC value");
+  }
+
+  const price = buyUsdc / sellStrk; // USDC per STRK
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Computed invalid STRK/USDC price from AVNU");
+  }
+
   return price;
 }
 
-/**
- * Returns an array of 1-minute candles (oldest → newest) for the requested
- * lookback window. Async to match your original contract.
- *
- * Each item:
- *  {
- *    ts: <candle start ms>,
- *    price: <close>,   // backwards compatible
- *    o: <open>,
- *    h: <high>,
- *    l: <low>,
- *    c: <close>,
- *  }
- */
-export async function getStrkPriceHistory({ lookbackMinutes = 240 } = {}) {
-  const cutoff = Date.now() - lookbackMinutes * MS_PER_MIN;
-  const result = [];
+// -------------------------------------------------------------
+// Warm-up helper: seed synthetic history around a real price
+// -------------------------------------------------------------
 
-  for (const c of candleHistory) {
-    if (c.startTs >= cutoff) {
-      result.push({
-        ts: c.startTs,
-        price: c.close,
-        o: c.open,
-        h: c.high,
-        l: c.low,
-        c: c.close,
-      });
-    }
+async function seedHistoryIfNeeded() {
+  if (history.length >= MIN_SEEDED_POINTS) return;
+
+  const basePrice = await fetchStrkUsdcPriceFromAvnu();
+  const now = Date.now();
+
+  history.length = 0; // reset
+
+  // Create 30 pseudo-historical points, 1 min apart, ±1% noise
+  for (let i = MIN_SEEDED_POINTS - 1; i >= 0; i--) {
+    const t = now - i * 60_000;
+    const jitterFactor = 1 + (Math.random() - 0.5) * 0.02; // ±1%
+    const price = basePrice * jitterFactor;
+    history.push({ t, price });
   }
-
-  if (currentCandle && currentCandle.startTs >= cutoff) {
-    result.push({
-      ts: currentCandle.startTs,
-      price: currentCandle.close,
-      o: currentCandle.open,
-      h: currentCandle.high,
-      l: currentCandle.low,
-      c: currentCandle.close,
-    });
-  }
-
-  return result;
 }
 
-/**
- * Optional raw accessor if you ever want raw candles for debugging.
- */
-export function getStrkCandlesRaw({ lookbackMinutes = 240 } = {}) {
-  const cutoff = Date.now() - lookbackMinutes * MS_PER_MIN;
-  const result = [];
+// -------------------------------------------------------------
+// Public API
+// -------------------------------------------------------------
 
-  for (const c of candleHistory) {
-    if (c.startTs >= cutoff) result.push({ ...c });
-  }
-  if (currentCandle && currentCandle.startTs >= cutoff) {
-    result.push({ ...currentCandle });
-  }
+export async function getLatestStrkPrice() {
+  try {
+    const price = await fetchStrkUsdcPriceFromAvnu();
 
-  return result;
+    history.push({ t: Date.now(), price });
+    if (history.length > 500) history.shift();
+
+    return price;
+  } catch (err) {
+    console.error(
+      "[priceFeed] AVNU STRK/USDC price fetch failed:",
+      err?.message || err,
+    );
+    return null;
+  }
+}
+
+export async function getStrkPriceHistory() {
+  // If we don't have enough history, seed it once
+  await seedHistoryIfNeeded();
+  // shallow copy so callers can't mutate internal array
+  return [...history];
 }
