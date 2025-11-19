@@ -142,6 +142,11 @@ async function registerTradingCommands(telegraf: Telegraf) {
     formatStopAndFlattenMessage,
     setAutoMode,
     autoTradeTick,
+    // Performance / PnL helpers
+    maybeBuildPeriodicPerformanceReport,
+    formatPeriodicPerformanceMessage,
+    getPerformanceSnapshot,
+    formatPerformanceSnapshotMessage,
   } = await import("./src/strategy/trading.mjs");
 
   // /paper_tick → run one paper trade tick and show what the bot *would* do.
@@ -212,7 +217,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
   });
 
   // /auto_on → enable 1-minute auto trading
-telegraf.command("auto_on", async (ctx) => {
+  telegraf.command("auto_on", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
       autoChats.add(chatId);
@@ -231,7 +236,7 @@ telegraf.command("auto_on", async (ctx) => {
       await ctx.reply("❌ Failed to enable auto trading. Check logs.");
     }
   });
-  
+
   // /auto_off → disable 1-minute auto trading
   telegraf.command("auto_off", async (ctx) => {
     try {
@@ -251,7 +256,20 @@ telegraf.command("auto_on", async (ctx) => {
       await ctx.reply("❌ Failed to disable auto trading. Check logs.");
     }
   });
-  
+
+  // /performance → show % change since last PnL baseline
+  telegraf.command("performance", async (ctx) => {
+    try {
+      const chatId = ctx.chat.id;
+      const snapshot = await getPerformanceSnapshot(chatId);
+      const msg = formatPerformanceSnapshotMessage(snapshot);
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    } catch (err: any) {
+      console.error("[telegram:/performance] error:", err);
+      await ctx.reply("❌ Failed to load performance. Check logs.");
+    }
+  });
+
   // 🔁 Auto loop: once per minute, at most one tick per minute per chat
   setInterval(async () => {
     try {
@@ -263,6 +281,15 @@ telegraf.command("auto_on", async (ctx) => {
               parse_mode: "Markdown",
             });
           }
+
+          // 12h PnL update
+          const pnlReport = await maybeBuildPeriodicPerformanceReport(chatId);
+          if (pnlReport) {
+            const pnlMsg = formatPeriodicPerformanceMessage(pnlReport);
+            await telegraf.telegram.sendMessage(chatId, pnlMsg, {
+              parse_mode: "Markdown",
+            });
+          }
         } catch (err: any) {
           console.error("[telegram:auto-loop] per-chat error:", err);
         }
@@ -271,7 +298,8 @@ telegraf.command("auto_on", async (ctx) => {
       console.error("[telegram:auto-loop] error:", err);
     }
   }, 60_000);
-}  
+}
+
 // -------------------------------------------------------------
 // Command registration: universe / watchlist
 // -------------------------------------------------------------
@@ -367,6 +395,7 @@ const telegramService = service({
             "/auto_on",
             "/auto_off",
             "/stop_and_flatten",
+            "/performance",
             "",
             "(or just type)",
           ].join("\n"),
@@ -389,6 +418,7 @@ const telegramService = service({
             "/auto_on",
             "/auto_off",
             "/stop_and_flatten",
+            "/performance",
           ].join("\n"),
         ),
       );
