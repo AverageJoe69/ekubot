@@ -20,6 +20,13 @@ function resolveOptional<T>(container: any, key: string): T | undefined {
   }
 }
 
+// Chats that have auto-trading enabled
+const autoChats = new Set<number>();
+
+// -------------------------------------------------------------
+// Formatting helpers
+// -------------------------------------------------------------
+
 function formatTrackingSnapshotMessage(snapshot: any): string {
   if (!snapshot.hasUniverse) {
     return "No universe set yet for this chat.\n\nUse `/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM` first.";
@@ -57,17 +64,7 @@ function formatTrackingSnapshotMessage(snapshot: any): string {
 
 /**
  * Format a human-readable summary of a trading universe/watchlist.
- * This consumes the shape returned by buildUniverseFromText in ekubo.mjs:
- *
- * {
- *   rawInput,
- *   symbols,
- *   tradable: [
- *     { symbol, address, decimals, usdcPools, hasUsdcPool, raw }
- *   ],
- *   unresolved: [...],
- *   updatedAt
- * }
+ * This consumes the shape returned by buildUniverseFromText in ekubo.mjs.
  */
 function formatUniverseMessage(universe: any | null | undefined): string {
   if (!universe || !universe.tradable) {
@@ -107,15 +104,10 @@ function formatUniverseMessage(universe: any | null | undefined): string {
   return lines.join("\n");
 }
 
-/**
- * Register Telegram commands that manage the trading universe/watchlist.
- *
- * - /set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM
- *   → builds a universe using Ekubo tokens + USDC pools and stores it per chat.
- *
- * - /show_universe
- *   → displays the current universe for this chat.
- */
+// -------------------------------------------------------------
+// Command registration: tracking (/show_pairs)
+// -------------------------------------------------------------
+
 async function registerTrackingCommands(telegraf: Telegraf) {
   const { buildTrackingSnapshot } = await import(
     "./src/strategy/tracker.mjs"
@@ -134,6 +126,10 @@ async function registerTrackingCommands(telegraf: Telegraf) {
   });
 }
 
+// -------------------------------------------------------------
+// Command registration: STRK trading
+// -------------------------------------------------------------
+
 async function registerTradingCommands(telegraf: Telegraf) {
   const {
     tradeTick,
@@ -144,6 +140,8 @@ async function registerTradingCommands(telegraf: Telegraf) {
     formatModeChangeMessage,
     stopAndFlatten,
     formatStopAndFlattenMessage,
+    setAutoMode,
+    autoTradeTick,
   } = await import("./src/strategy/trading.mjs");
 
   // /paper_tick → run one paper trade tick and show what the bot *would* do.
@@ -151,20 +149,16 @@ async function registerTradingCommands(telegraf: Telegraf) {
     try {
       const chatId = ctx.chat.id;
       await ctx.reply("⏳ Running paper trade tick for current universe…");
-
       const result = await tradeTick(chatId, { mode: "paper" });
       const msg = formatPaperTickMessage(result);
-
       await ctx.reply(msg, { parse_mode: "Markdown" });
     } catch (err: any) {
       console.error("[telegram:/paper_tick] error:", err);
-      await ctx.reply(
-        "❌ Paper trade tick failed. Check logs for details.",
-      );
+      await ctx.reply("❌ Paper trade tick failed. Check logs for details.");
     }
   });
 
-  // /strk_status → show balances + mode + equity
+  // /strk_status → show current mode, price and balances
   telegraf.command("strk_status", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -177,7 +171,7 @@ async function registerTradingCommands(telegraf: Telegraf) {
     }
   });
 
-  // /live_on → set mode to live (future real trades)
+  // /live_on → switch mode to LIVE (execution still stubbed)
   telegraf.command("live_on", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -186,11 +180,11 @@ async function registerTradingCommands(telegraf: Telegraf) {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     } catch (err: any) {
       console.error("[telegram:/live_on] error:", err);
-      await ctx.reply("❌ Failed to enable live mode.");
+      await ctx.reply("❌ Failed to switch to LIVE mode. Check logs.");
     }
   });
 
-  // /live_off → set mode to paper
+  // /live_off → switch mode back to PAPER
   telegraf.command("live_off", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
@@ -199,15 +193,15 @@ async function registerTradingCommands(telegraf: Telegraf) {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     } catch (err: any) {
       console.error("[telegram:/live_off] error:", err);
-      await ctx.reply("❌ Failed to disable live mode.");
+      await ctx.reply("❌ Failed to switch to PAPER mode. Check logs.");
     }
   });
 
-  // /stop_and_flatten → stop trading & convert STRK → USDC (paper)
+  // /stop_and_flatten → sell all STRK → USDC (paper) and disable auto
   telegraf.command("stop_and_flatten", async (ctx) => {
     try {
       const chatId = ctx.chat.id;
-      await ctx.reply("🛑 Stopping trading and selling all STRK to USDC…");
+      autoChats.delete(chatId);
       const res = await stopAndFlatten(chatId);
       const msg = formatStopAndFlattenMessage(res);
       await ctx.reply(msg, { parse_mode: "Markdown" });
@@ -216,7 +210,72 @@ async function registerTradingCommands(telegraf: Telegraf) {
       await ctx.reply("❌ Failed to stop and flatten. Check logs.");
     }
   });
+
+  // /auto_on → enable hourly auto trading
+  telegraf.command("auto_on", async (ctx) => {
+    try {
+      const chatId = ctx.chat.id;
+      autoChats.add(chatId);
+      const cfg = setAutoMode(chatId, true);
+      await ctx.reply(
+        [
+          "🔁 Auto trading enabled for this chat.",
+          "",
+          `Mode: ${cfg.mode.toUpperCase()}`,
+          "The bot will run one tick each hour when a new candle prints.",
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    } catch (err: any) {
+      console.error("[telegram:/auto_on] error:", err);
+      await ctx.reply("❌ Failed to enable auto trading. Check logs.");
+    }
+  });
+
+  // /auto_off → disable hourly auto trading
+  telegraf.command("auto_off", async (ctx) => {
+    try {
+      const chatId = ctx.chat.id;
+      autoChats.delete(chatId);
+      const cfg = setAutoMode(chatId, false);
+      await ctx.reply(
+        [
+          "⏹ Auto trading disabled for this chat.",
+          "",
+          `Mode: ${cfg.mode.toUpperCase()}`,
+        ].join("\n"),
+        { parse_mode: "Markdown" },
+      );
+    } catch (err: any) {
+      console.error("[telegram:/auto_off] error:", err);
+      await ctx.reply("❌ Failed to disable auto trading. Check logs.");
+    }
+  });
+
+  // 🔁 Auto loop: once per minute, run at most one tick per hour per chat
+  setInterval(async () => {
+    try {
+      for (const chatId of autoChats) {
+        try {
+          const { autoRan, message } = await autoTradeTick(chatId);
+          if (autoRan && message) {
+            await telegraf.telegram.sendMessage(chatId, message, {
+              parse_mode: "Markdown",
+            });
+          }
+        } catch (err: any) {
+          console.error("[telegram:auto-loop] per-chat error:", err);
+        }
+      }
+    } catch (err: any) {
+      console.error("[telegram:auto-loop] error:", err);
+    }
+  }, 60_000);
 }
+
+// -------------------------------------------------------------
+// Command registration: universe / watchlist
+// -------------------------------------------------------------
 
 async function registerUniverseCommands(telegraf: Telegraf) {
   // Dynamic imports to avoid TS/ESM pain with .mjs from a .ts file.
@@ -273,6 +332,10 @@ async function registerUniverseCommands(telegraf: Telegraf) {
   });
 }
 
+// -------------------------------------------------------------
+// Daydreams service + boot
+// -------------------------------------------------------------
+
 const telegramService = service({
   register(container) {
     const token = process.env.TELEGRAM_TOKEN;
@@ -302,6 +365,8 @@ const telegramService = service({
             "/strk_status",
             "/live_on",
             "/live_off",
+            "/auto_on",
+            "/auto_off",
             "/stop_and_flatten",
             "",
             "(or just type)",
@@ -315,13 +380,15 @@ const telegramService = service({
             "Commands:",
             "/goal <text>",
             "/status",
-            "/set_universe STRK, EKUBO, DOG, ETH, BONK, PUMP, MIM",
+            "/set_universe <symbols>",
             "/show_universe",
             "/show_pairs",
             "/paper_tick",
             "/strk_status",
             "/live_on",
             "/live_off",
+            "/auto_on",
+            "/auto_off",
             "/stop_and_flatten",
           ].join("\n"),
         ),
@@ -376,6 +443,10 @@ const telegramService = service({
     }
   },
 });
+
+// -------------------------------------------------------------
+// Daydreams context + I/O wiring
+// -------------------------------------------------------------
 
 const telegramChat = context({
   type: "telegram:chat",
