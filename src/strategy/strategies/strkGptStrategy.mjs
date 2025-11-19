@@ -1,74 +1,88 @@
 // src/strategy/strategies/strkGptStrategy.mjs
-import OpenAI from "openai";
+// -------------------------------------------------------------
+// Dependency-free STRK swing strategy.
+// Uses short vs long moving averages on the AVNU price feed.
+// No OpenAI / no external packages.
+// -------------------------------------------------------------
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Build a compact prompt
-function buildPrompt(priceData, latestPrice, position) {
-  const series = priceData.map(p => p.price.toFixed(4)).join(", ");
-
-  return `
-You are an automated crypto swing-trader.
-
-Asset: STRK/USDC
-Latest price: ${latestPrice}
-Current position:
-- USDC: ${position.usdc}
-- STRK: ${position.strk}
-
-Last 60 minutes price series:
-${series}
-
-Goal: maximise profit by swing trading. Use strict discipline:
-- BUY only if a bullish reversal is likely.
-- SELL only if a bearish reversal is likely.
-- HOLD if uncertain.
-
-Answer ONLY with JSON in this format:
-
-{
-  "action": "BUY" | "SELL" | "HOLD",
-  "confidence": 0.0–1.0,
-  "reason": "short explanation"
-}
-`;
-}
-
+/**
+ * ctx: {
+ *   chatId,
+ *   snapshot,
+ *   priceData: [{ ts, price }],
+ *   latestPrice: number,
+ *   position: { usdc, strk, latestPrice },
+ *   now,
+ *   mode
+ * }
+ */
 export async function strkGptStrategy(ctx) {
   const { priceData, latestPrice, position } = ctx;
 
-  const prompt = buildPrompt(priceData, latestPrice, position);
+  const prices = (priceData || [])
+    .map((p) => p.price)
+    .filter((x) => typeof x === "number" && x > 0);
 
-  const response = await client.chat.completions.create({
-    model: "gpt-4.1-mini",
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: "You are a disciplined crypto swing trader." },
-      { role: "user", content: prompt },
-    ],
-  });
-
-  const data = response.choices[0].message.parsed;
-
-  if (!data || !data.action) {
-    return []; // Default HOLD
+  if (!latestPrice || latestPrice <= 0) {
+    return [];
   }
 
-  const action = data.action.toUpperCase();
+  // Need at least 20 points for MA
+  if (prices.length < 20) {
+    return [];
+  }
 
-  if (action === "HOLD") return [];
+  const sma = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
-  const sizeUsd = 50; // fixed for now, configurable later
+  const shortWindow = 5;
+  const longWindow = 20;
 
-  return [
-    {
-      strategy: "gpt-swing",
-      side: action,
-      sizeUsd,
-      reason: data.reason,
-      confidence: data.confidence ?? 0,
-    },
-  ];
+  const shortMA = sma(prices.slice(-shortWindow));
+  const longMA = sma(prices.slice(-longWindow));
+
+  const momentum = shortMA - longMA;
+  const relDiff = longMA ? momentum / longMA : 0;
+
+  const usdc = Number(position.usdc ?? 0);
+  const strk = Number(position.strk ?? 0);
+  const strkUsd = strk * latestPrice;
+
+  // Tunable knobs
+  const baseSizeUsd = 50;      // target trade size
+  const minRelDiff = 0.003;    // 0.3% threshold to act
+
+  // BUY condition: short MA > long MA by threshold and we have USDC
+  if (relDiff > minRelDiff && usdc >= 10) {
+    const strength = Math.min(1, relDiff / 0.01); // saturate at ~1% diff
+    const sizeUsd = Math.min(usdc, baseSizeUsd * (0.5 + strength));
+
+    return [
+      {
+        strategy: "ma-swing",
+        side: "BUY",
+        sizeUsd,
+        confidence: strength,
+        reason: `short MA above long MA by ${(relDiff * 100).toFixed(2)}%`,
+      },
+    ];
+  }
+
+  // SELL condition: short MA < long MA by threshold and we have STRK
+  if (relDiff < -minRelDiff && strkUsd >= 10) {
+    const strength = Math.min(1, (-relDiff) / 0.01);
+    const sizeUsd = Math.min(strkUsd, baseSizeUsd * (0.5 + strength));
+
+    return [
+      {
+        strategy: "ma-swing",
+        side: "SELL",
+        sizeUsd,
+        confidence: strength,
+        reason: `short MA below long MA by ${(relDiff * 100).toFixed(2)}%`,
+      },
+    ];
+  }
+
+  // Otherwise: HOLD
+  return [];
 }
