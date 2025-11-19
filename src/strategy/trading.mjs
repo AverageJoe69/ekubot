@@ -13,6 +13,7 @@ import {
 // NOTE: this resets on process restart – fine for now.
 const positions = new Map(); // chatId -> { usdc, strk }
 const configs = new Map();   // chatId -> { mode: "paper"|"live", enabled: boolean }
+const riskState = new Map(); // chatId -> { lastBuyPrice: number | null }
 
 function chatKey(chatId) {
   return String(chatId);
@@ -44,97 +45,167 @@ function ensureConfig(chatId) {
   return cfg;
 }
 
+function ensureRisk(chatId) {
+  const key = chatKey(chatId);
+  let rs = riskState.get(key);
+  if (!rs) {
+    rs = { lastBuyPrice: null };
+    riskState.set(key, rs);
+  }
+  return rs;
+}
+
 // -------------------------------------------------------------
 // Core tick
 // -------------------------------------------------------------
 
+// Simple risk knobs for now
+const TAKE_PROFIT_PCT = 0.02; // +2% → take profit
+const STOP_LOSS_PCT   = 0.01; // -1% → stop loss
+
+/**
+ * tradeTick(chatId, { mode })
+ * mode = "paper" | "live"
+ */
 export async function tradeTick(chatId, { mode = "paper" } = {}) {
-    const now = new Date().toISOString();
-  
-    const cfg = ensureConfig(chatId);
-    const pos = ensurePosition(chatId);
-  
-    // 1. Price data
-    const priceData = await getStrkPriceHistory();
-    const latestPrice = await getLatestStrkPrice();
-  
-    // 2. Build a minimal snapshot compatible with baseStrategy
-    const snapshot = {
-      tokens: [
-        {
-          symbol: "STRK",
-          address: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
-          bestPool: {
-            keyHash: "STRK/USDC",
-            fee: "0x0",
-            tickSpacing: "0x0",
-            liquidityBigInt: 1000000000000000000n, // pretend 1e18
-          },
-        },
-      ],
-    };
-  
-    // 3. Ask strategy
-    const intents = await strkGptStrategy({
-        chatId,
-      snapshot,       // ← FIXED: strategy now works again
-      priceData,
-      latestPrice,
-      position: { ...pos, latestPrice },
-      now,
-      mode,
-    });
-  
-    // 4. No intent → HOLD
-    if (!intents.length) {
-      return {
-        updatedAt: now,
-        mode,
-        price: latestPrice,
-        intents: [],
-        position: { ...pos },
-        notes: "GPT decided to HOLD",
-      };
-    }
-  
-    // 5. Apply paper mode
-    const intent = intents[0];
-    if (mode === "paper") {
-      applyPaperTrade(pos, intent, latestPrice);
-      positions.set(chatKey(chatId), pos);
-      return {
-        updatedAt: now,
-        mode,
-        price: latestPrice,
-        intents: [intent],
-        position: { ...pos },
-      };
-    }
-  
-    // 6. Live (future)
-    if (mode === "live") {
-      return {
-        updatedAt: now,
-        mode,
-        price: latestPrice,
-        intents: [intent],
-        position: { ...pos },
-        liveWarning: "live execution not implemented yet",
-      };
-    }
-  
+  const now = new Date().toISOString();
+
+  const cfg = ensureConfig(chatId);
+  const pos = ensurePosition(chatId);
+  const risk = ensureRisk(chatId);
+
+  // 1. Price data
+  const priceData = await getStrkPriceHistory();
+  const latestPrice = await getLatestStrkPrice();
+
+  if (!latestPrice || latestPrice <= 0) {
     return {
       updatedAt: now,
       mode,
       price: latestPrice,
       intents: [],
       position: { ...pos },
-      notes: "Unknown mode",
+      notes: "Latest STRK price unavailable, holding.",
     };
   }
-  
 
-function applyPaperTrade(position, intent, latestPrice) {
+  const strkUsd = pos.strk * latestPrice;
+  let intents = [];
+
+  // 2. Risk management: take-profit / stop-loss
+  if (pos.strk > 0 && risk.lastBuyPrice && risk.lastBuyPrice > 0) {
+    const entry = risk.lastBuyPrice;
+    const change = (latestPrice - entry) / entry;
+
+    if (change >= TAKE_PROFIT_PCT) {
+      // Take profit: close full position
+      const sizeUsd = strkUsd;
+      intents.push({
+        strategy: "risk-mgmt",
+        side: "SELL",
+        sizeUsd,
+        confidence: 1.0,
+        reason: `take-profit: price ${(change * 100).toFixed(2)}% above entry (${entry.toFixed(
+          4,
+        )} → ${latestPrice.toFixed(4)})`,
+      });
+    } else if (change <= -STOP_LOSS_PCT) {
+      // Stop loss: close full position
+      const sizeUsd = strkUsd;
+      intents.push({
+        strategy: "risk-mgmt",
+        side: "SELL",
+        sizeUsd,
+        confidence: 1.0,
+        reason: `stop-loss: price ${(change * 100).toFixed(2)}% below entry (${entry.toFixed(
+          4,
+        )} → ${latestPrice.toFixed(4)})`,
+      });
+    }
+  }
+
+  // 3. If no risk intent, ask strategy (MA-based swing)
+  if (!intents.length) {
+    const snapshot = {
+      tokens: [
+        {
+          symbol: "STRK",
+          address: "0x4718f5...", // synthetic; not used for pricing
+          bestPool: {
+            keyHash: "STRK/USDC",
+            fee: "0x0",
+            tickSpacing: "0x0",
+            liquidityBigInt: 1000000000000000000n,
+          },
+        },
+      ],
+    };
+
+    const stratIntents = await strkGptStrategy({
+      chatId,
+      snapshot,
+      priceData,
+      latestPrice,
+      position: { ...pos, latestPrice },
+      now,
+      mode,
+    });
+
+    intents = stratIntents || [];
+  }
+
+  // 4. No intent → HOLD
+  if (!intents.length) {
+    return {
+      updatedAt: now,
+      mode,
+      price: latestPrice,
+      intents: [],
+      position: { ...pos },
+      notes: "GPT decided to HOLD",
+    };
+  }
+
+  // For now we only ever apply the first intent.
+  const intent = intents[0];
+
+  if (mode === "paper") {
+    applyPaperTrade(pos, intent, latestPrice, risk);
+    positions.set(chatKey(chatId), pos);
+    riskState.set(chatKey(chatId), risk);
+
+    return {
+      updatedAt: now,
+      mode,
+      price: latestPrice,
+      intents: [intent],
+      position: { ...pos },
+    };
+  }
+
+  if (mode === "live") {
+    // TODO: wire real Ekubo/AVNU swap here later
+    return {
+      updatedAt: now,
+      mode,
+      price: latestPrice,
+      intents: [intent],
+      position: { ...pos },
+      liveWarning: "live execution not implemented yet",
+    };
+  }
+
+  return {
+    updatedAt: now,
+    mode,
+    price: latestPrice,
+    intents: [],
+    position: { ...pos },
+    notes: "Unknown mode",
+  };
+}
+
+function applyPaperTrade(position, intent, latestPrice, risk) {
   const side = intent.side;
   const sizeUsd = Number(intent.sizeUsd || 0);
 
@@ -145,16 +216,27 @@ function applyPaperTrade(position, intent, latestPrice) {
       const strkAmount = sizeUsd / latestPrice;
       position.usdc -= sizeUsd;
       position.strk += strkAmount;
+
+      // Update last entry price to this buy
+      risk.lastBuyPrice = latestPrice;
     }
   }
 
   if (side === "SELL") {
     const maxSellUsd = position.strk * latestPrice;
     if (maxSellUsd <= 0) return;
+
     const sellUsd = Math.min(sizeUsd, maxSellUsd);
     const strkToSell = sellUsd / latestPrice;
+
     position.strk -= strkToSell;
     position.usdc += sellUsd;
+
+    // If we've effectively closed the position, clear lastBuyPrice
+    if (position.strk <= 1e-9) {
+      position.strk = 0;
+      risk.lastBuyPrice = null;
+    }
   }
 }
 
@@ -168,8 +250,7 @@ export async function getTradingStatus(chatId) {
   const pos = ensurePosition(chatId);
   const latestPrice = await getLatestStrkPrice();
 
-  const equity =
-    pos.usdc + pos.strk * (latestPrice || 0);
+  const equity = pos.usdc + pos.strk * (latestPrice || 0);
 
   return {
     chatId: chatKey(chatId),
@@ -197,6 +278,7 @@ export function setLiveMode(chatId, live) {
 export async function stopAndFlatten(chatId) {
   const cfg = ensureConfig(chatId);
   const pos = ensurePosition(chatId);
+  const risk = ensureRisk(chatId);
   const latestPrice = await getLatestStrkPrice();
 
   const realizedUsd = pos.strk * (latestPrice || 0);
@@ -206,9 +288,11 @@ export async function stopAndFlatten(chatId) {
 
   cfg.mode = "paper";
   cfg.enabled = false;
+  risk.lastBuyPrice = null;
 
   positions.set(chatKey(chatId), pos);
   configs.set(chatKey(chatId), cfg);
+  riskState.set(chatKey(chatId), risk);
 
   return {
     chatId: chatKey(chatId),
@@ -237,12 +321,11 @@ export function formatPaperTickMessage(result) {
   );
 
   const pos = result.position || { usdc: 0, strk: 0 };
+  const price = result.price || 0;
   lines.push(
     `Balance:`,
     `• USDC: ${pos.usdc.toFixed(2)}`,
-    `• STRK: ${pos.strk.toFixed(6)} (≈ $${(pos.strk * result.price).toFixed(
-      2,
-    )})`,
+    `• STRK: ${pos.strk.toFixed(6)} (≈ $${(pos.strk * price).toFixed(2)})`,
     "",
   );
 
